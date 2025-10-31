@@ -2,309 +2,57 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>HoverGreens Vision — Ball Isolation Tuner</title>
-<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>HoverGreens — CV Boot Test</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
-  body { margin:0; background:#000; color:#fff; font-family:Arial,Helvetica,sans-serif; }
-  .wrap { width:1180px; margin:10px auto; }
-  h2 { margin:6px 0 10px; font-size:18px; }
-  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
-  select, button, input[type=range] { background:#111; color:#fff; border:1px solid #444; border-radius:6px; padding:8px 10px; }
-  button { cursor:pointer; }
-  label { font-size:12px; color:#bbb; }
-  .slider { width:220px; }
-  #status { color:#7dff7d; font-size:13px; min-height:18px; margin:8px 0; white-space:pre-wrap; }
-  video { display:none; }
-  #view { display:block; width:1180px; height:370px; background:#111; margin:10px 0; }
-  .thumbs { position:absolute; right:12px; top:12px; display:grid; gap:8px; }
-  .thumbs canvas { width:220px; height:124px; background:#000; border:1px solid #333; }
-  .stage { position:relative; }
-  .pill { display:inline-block; font-size:12px; padding:3px 8px; border:1px solid #333; border-radius:999px; color:#ccc; margin-left:8px; }
+  body { background:black; color:white; text-align:center; font-family:Arial;}
+  #status { margin:10px; font-size:18px; }
+  video, canvas { width:1180px; height:370px; background:#111; display:block; margin:auto;}
 </style>
 <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 </head>
 <body>
-<div class="wrap">
-  <h2>HoverGreens Vision — Ball Isolation Tuner
-    <span class="pill">Glossy White</span>
-    <span class="pill">Medium Green</span>
-    <span class="pill">LED</span>
-  </h2>
 
-  <div class="row">
-    <select id="camSelect"></select>
-    <button id="startBtn">Start Camera</button>
-    <button id="learnBtn">Click-to-Learn Ball</button>
-    <button id="resetBtn">Reset View</button>
-    <label><input type="checkbox" id="useLearned"> Use learned thresholds</label>
-    <label><input type="radio" name="pick" value="area" checked> Largest Blob</label>
-    <label><input type="radio" name="pick" value="circular"> Most Circular</label>
-  </div>
+<h2>HoverGreens Vision — OpenCV Boot Test</h2>
+<div id="status">Booting OpenCV…</div>
 
-  <div class="row" style="margin-top:6px">
-    <label>Vmin (brightness) <span id="vminVal">190</span><br>
-      <input id="vmin" class="slider" type="range" min="120" max="255" step="1" value="190">
-    </label>
-    <label>Smax (desat) <span id="smaxVal">75</span><br>
-      <input id="smax" class="slider" type="range" min="10" max="150" step="1" value="75">
-    </label>
-    <label>Min Area <span id="aminVal">120</span><br>
-      <input id="amin" class="slider" type="range" min="20" max="2000" step="10" value="120">
-    </label>
-    <label>Morph Kernel <span id="kval">3</span><br>
-      <input id="k" class="slider" type="range" min="1" max="11" step="2" value="3">
-    </label>
-  </div>
-
-  <div id="status">Loading cameras…</div>
-
-  <video id="video" autoplay playsinline></video>
-
-  <div class="stage">
-    <canvas id="view" width="1180" height="370"></canvas>
-    <div class="thumbs">
-      <canvas id="grayThumb" width="220" height="124" title="Grayscale"></canvas>
-      <canvas id="maskThumb" width="220" height="124" title="Mask"></canvas>
-    </div>
-  </div>
-</div>
+<video id="v" autoplay playsinline></video>
+<canvas id="c" width="1180" height="370"></canvas>
 
 <script>
-const camSelect = document.getElementById('camSelect');
-const startBtn  = document.getElementById('startBtn');
-const learnBtn  = document.getElementById('learnBtn');
-const resetBtn  = document.getElementById('resetBtn');
-const useLearned= document.getElementById('useLearned');
-const vmin      = document.getElementById('vmin');
-const smax      = document.getElementById('smax');
-const amin      = document.getElementById('amin');
-const kval      = document.getElementById('k');
-const vminVal   = document.getElementById('vminVal');
-const smaxVal   = document.getElementById('smaxVal');
-const aminVal   = document.getElementById('aminVal');
-const kvalVal   = document.getElementById('kval');
-const statusEl  = document.getElementById('status');
+const statusEl=document.getElementById("status");
+const video=document.getElementById("v");
+const canvas=document.getElementById("c");
+const ctx=canvas.getContext("2d");
 
-const video = document.getElementById('video');
-const view  = document.getElementById('view');
-const ctx   = view.getContext('2d');
-const grayThumb = document.getElementById('grayThumb').getContext('2d');
-const maskThumb = document.getElementById('maskThumb').getContext('2d');
+statusEl.textContent="Requesting camera…";
 
-let cvReady=false;
-let pickingMode='area'; // or 'circular'
-document.querySelectorAll('input[name="pick"]').forEach(r=>{
-  r.onchange = ()=> pickingMode = r.value;
+navigator.mediaDevices.getUserMedia({video:true}).then(stream=>{
+  video.srcObject=stream;
+  video.onloadedmetadata=()=>video.play();
+  statusEl.textContent="Camera ready — waiting for OpenCV…";
+}).catch(_=>{
+  statusEl.textContent="Camera blocked. Allow permission.";
 });
-
-function setStatus(t){ statusEl.textContent = t; }
-
-async function loadCams(){
-  try {
-    await navigator.mediaDevices.getUserMedia({video:true});
-    const devs = await navigator.mediaDevices.enumerateDevices();
-    const cams = devs.filter(d=>d.kind==='videoinput');
-    camSelect.innerHTML='';
-    cams.forEach((c,i)=>{
-      const opt=document.createElement('option');
-      opt.value=c.deviceId;
-      opt.text=c.label||`Camera ${i+1}`;
-      camSelect.appendChild(opt);
-    });
-    setStatus('✅ Cameras found — select one and Start');
-  } catch(e){
-    setStatus('❌ Please allow camera permission in your browser.');
-  }
-}
-loadCams();
-
-[vmin, smax, amin, kval].forEach(sl=>{
-  const m = { vmin:vminVal, smax:smaxVal, amin:aminVal, k:kvalVal }[sl.id];
-  const upd=()=> m.textContent = sl.value;
-  sl.oninput = upd; upd();
-});
-
-startBtn.onclick = async ()=>{
-  const id = camSelect.value;
-  try{
-    const stream = await navigator.mediaDevices.getUserMedia({ video:{ deviceId:{ exact:id } } });
-    video.srcObject = stream;
-    await video.play().catch(()=>{});
-    setStatus('🎥 Camera streaming — adjust sliders until mask shows ball.');
-    requestAnimationFrame(loop);
-  }catch(e){
-    setStatus('❌ Could not start camera.');
-  }
-};
-
-resetBtn.onclick = ()=>{
-  // nothing fancy yet—just clears overlays next frame
-  setStatus('↺ Reset overlays; continue tuning.');
-};
-
-// Learn ball thresholds from click
-let learned = { use:false, Vmin:190, Smax:75 };
-learnBtn.onclick = ()=>{
-  setStatus('👆 Click on ball center to sample…');
-  view.style.cursor='crosshair';
-  const once = (e)=>{
-    view.style.cursor='default';
-    view.removeEventListener('click', once);
-    const r = view.getBoundingClientRect();
-    const x = (e.clientX - r.left) * (view.width / r.width);
-    const y = (e.clientY - r.top)  * (view.height / r.height);
-
-    // sample 20x20 patch and compute mean HSV
-    let src = new cv.Mat(view.height, view.width, cv.CV_8UC4);
-    new cv.VideoCapture(video).read(src);
-    let patch = src.roi(new cv.Rect(Math.max(0,x-10), Math.max(0,y-10), Math.min(20, view.width-x+10), Math.min(20, view.height-y+10)));
-    let hsv  = new cv.Mat();
-    cv.cvtColor(patch, hsv, cv.COLOR_RGBA2HSV);
-    let mean = cv.mean(hsv);
-    // mean is [H,S,V,A]
-    learned.Vmin = Math.max(120, Math.min(255, mean[2] - 15)); // slightly below mean V
-    learned.Smax = Math.max(10,  Math.min(150, mean[1] + 10)); // slightly above mean S
-    vmin.value = learned.Vmin; vmin.dispatchEvent(new Event('input'));
-    smax.value = learned.Smax; smax.dispatchEvent(new Event('input'));
-    useLearned.checked = true;
-    setStatus(`✅ Learned ball: Vmin≈${learned.Vmin.toFixed(0)}, Smax≈${learned.Smax.toFixed(0)} — keep tuning if needed.`);
-    src.delete(); patch.delete(); hsv.delete();
-  };
-  view.addEventListener('click', once);
-};
-
-// Core detect (HSV mask for glossy white on green w/ shadow tolerance)
-function detectBallAndMask(){
-  const W=view.width, H=view.height;
-
-  let src = new cv.Mat(H, W, cv.CV_8UC4);
-  new cv.VideoCapture(video).read(src);
-
-  // Previews: grayscale + HSV.V
-  let gray = new cv.Mat();
-  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-
-  let hsv = new cv.Mat();
-  cv.cvtColor(src, hsv, cv.COLOR_RGBA2HSV);
-
-  // thresholds
-  const VMIN = +vmin.value; // bright
-  const SMAX = +smax.value; // low saturation (white-ish)
-  const K    = +kval.value  // morph kernel
-
-  // Split HSV channels
-  let chans = new cv.MatVector();
-  cv.split(hsv, chans);
-  let Hch = chans.get(0), Sch = chans.get(1), Vch = chans.get(2);
-
-  // white-ish, bright: S <= SMAX, V >= VMIN
-  let sMask = new cv.Mat(), vMask = new cv.Mat();
-  cv.threshold(Sch, sMask, SMAX, 255, cv.THRESH_BINARY_INV);
-  cv.threshold(Vch, vMask, VMIN, 255, cv.THRESH_BINARY);
-
-  let mask = new cv.Mat();
-  cv.bitwise_and(sMask, vMask, mask);
-
-  // Morph close to fill shadow dents
-  if (K >= 1) {
-    const k = cv.Mat.ones(K, K, cv.CV_8U);
-    cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, k);
-    k.delete();
-  }
-  // Blur a bit to smooth
-  cv.GaussianBlur(mask, mask, new cv.Size(5,5), 0);
-
-  // Find contours
-  let cnts = new cv.MatVector(), hier = new cv.Mat();
-  cv.findContours(mask, cnts, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-
-  let best = null, bestScore = -1;
-
-  for (let i=0;i<cnts.size();i++){
-    const c = cnts.get(i);
-    const area = cv.contourArea(c);
-    if (area < +amin.value) continue;
-
-    if (pickingMode === 'area') {
-      if (area > bestScore) { bestScore = area; best = c; }
-    } else {
-      // circularity score = 4πA / P^2
-      let peri = cv.arcLength(c, true);
-      if (peri <= 0) continue;
-      let circ = (4*Math.PI*area)/(peri*peri);
-      if (circ > bestScore) { bestScore = circ; best = c; }
-    }
-  }
-
-  // compute centroid
-  let center = null;
-  if (best) {
-    const m = cv.moments(best);
-    if (m.m00 !== 0) center = { x: m.m10/m.m00, y: m.m01/m.m00 };
-  }
-
-  // Draw thumbnails
-  {
-    // grayscale preview
-    let gSmall = new cv.Mat(); cv.resize(gray, gSmall, new cv.Size(220,124));
-    let gRGBA  = new cv.Mat(); cv.cvtColor(gSmall, gRGBA, cv.COLOR_GRAY2RGBA);
-    const gImg = new ImageData(new Uint8ClampedArray(gRGBA.data), gRGBA.cols, gRGBA.rows);
-    grayThumb.putImageData(gImg, 0, 0);
-    gSmall.delete(); gRGBA.delete();
-
-    // mask preview
-    let mSmall = new cv.Mat(); cv.resize(mask, mSmall, new cv.Size(220,124));
-    let mRGBA  = new cv.Mat(); cv.cvtColor(mSmall, mRGBA, cv.COLOR_GRAY2RGBA);
-    const mImg = new ImageData(new Uint8ClampedArray(mRGBA.data), mRGBA.cols, mRGBA.rows);
-    maskThumb.putImageData(mImg, 0, 0);
-    mSmall.delete(); mRGBA.delete();
-  }
-
-  // Cleanup
-  gray.delete(); hsv.delete(); Hch.delete(); Sch.delete(); Vch.delete();
-  sMask.delete(); vMask.delete(); cnts.delete(); hier.delete(); chans.delete();
-
-  return { center, maskUsed: mask, src }; // return mask/src for optional debugging (we’ll delete after draw)
-}
 
 function loop(){
-  // draw mirrored video
-  ctx.save(); ctx.scale(-1,1);
-  ctx.drawImage(video, -view.width, 0, view.width, view.height);
+  ctx.save();
+  ctx.scale(-1,1);
+  ctx.drawImage(video,-canvas.width,0,canvas.width,canvas.height);
   ctx.restore();
 
-  if (cvReady) {
-    const { center, maskUsed, src } = detectBallAndMask();
-
-    if (center) {
-      // big highlight + coordinates
-      ctx.strokeStyle = '#00eaff';
-      ctx.lineWidth = 4;
-      ctx.beginPath(); ctx.arc(center.x, center.y, 14, 0, Math.PI*2); ctx.stroke();
-
-      ctx.fillStyle = '#00eaff';
-      ctx.font = '18px Arial';
-      ctx.fillText(`Ball: ${center.x.toFixed(0)}, ${center.y.toFixed(0)}`, 12, 28);
-    }
-
-    // always cleanup
-    maskUsed.delete(); src.delete();
-  }
+  // small white dot to prove drawing works
+  ctx.fillStyle="white";
+  ctx.beginPath();
+  ctx.arc(50,50,10,0,Math.PI*2);
+  ctx.fill();
 
   requestAnimationFrame(loop);
 }
 
 cv.onRuntimeInitialized = ()=>{
-  cvReady = true;
-  setStatus('✅ Vision engine loaded — tune Vmin/Smax; use Learn on ball if needed.');
-};
-
-// If user checks "Use learned", we simply keep the sliders at learned values (already set by Learn).
-useLearned.onchange = ()=>{
-  if (useLearned.checked) {
-    vmin.value = Math.round(learned.Vmin); vmin.dispatchEvent(new Event('input'));
-    smax.value = Math.round(learned.Smax); smax.dispatchEvent(new Event('input'));
-  }
+  statusEl.textContent="✅ OpenCV Ready — drawing enabled";
+  loop();
 };
 </script>
 </body>
