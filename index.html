@@ -1,13 +1,77 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>HoverGreens Test Page</title>
-  <style>
-    body { background:black; color:white; font-size:24px; text-align:center; }
-  </style>
+<meta charset="UTF-8">
+<title>HoverGreens Vision Prototype</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<style>
+  body { margin:0; background:black; color:white; font-family:Arial; text-align:center; }
+  .wrap { width:1180px; margin:10px auto; }
+  canvas { width:1180px; height:370px; background:#111; }
+  select,button { padding:10px 15px; margin:5px; background:#111; color:white; border:1px solid #555; border-radius:6px; font-size:16px; }
+  button.primary { border-color:#4cff70; }
+  #log { font-size:14px; color:#0f0; min-height:20px; margin-top:8px; }
+</style>
 </head>
+
 <body>
-  ✅ HoverGreens test page loaded
+
+<div class="wrap">
+  <h2>HoverGreens Vision</h2>
+
+  <select id="cams"></select>
+  <button id="start" class="primary">Start Camera</button>
+
+  <div id="log">Loading cameras…</div>
+
+  <video id="video" autoplay playsinline style="display:none;"></video>
+  <canvas id="view" width="1180" height="370"></canvas>
+</div>
+
+<script>
+const cams = document.getElementById("cams");
+const start = document.getElementById("start");
+const log = t => document.getElementById("log").textContent = t;
+const video = document.getElementById("video");
+const canvas = document.getElementById("view");
+const ctx = canvas.getContext("2d");
+
+// load cameras
+navigator.mediaDevices.getUserMedia({video:true}).then(async() => {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  devices.filter(d => d.kind==="videoinput").forEach((cam,i)=>{
+    const opt = document.createElement("option");
+    opt.value = cam.deviceId;
+    opt.text = cam.label || `Camera ${i+1}`;
+    cams.appendChild(opt);
+  });
+  log("✅ Cameras ready — pick one, then Start");
+});
+
+// start camera
+start.onclick = async() => {
+  log("📷 Starting camera…");
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video:{ deviceId:{exact:cams.value}}
+  });
+  video.srcObject = stream;
+  await video.play().catch(()=>{});
+
+  log("✅ Camera streaming live");
+
+  // draw loop
+  const draw = () => {
+    ctx.save();
+    ctx.scale(-1,1);
+    ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
+    ctx.restore();
+    requestAnimationFrame(draw);
+  };
+  draw();
+};
+</script>
+
 </body>
 </html>
