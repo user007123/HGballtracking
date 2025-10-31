@@ -1,342 +1,109 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <title>HoverGreens Vision — Ball Tracer</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <style>
-    :root { --w: 1180px; --h: 370px; }
-    body { margin:0; background:#000; color:#fff; font-family:Arial,Helvetica,sans-serif; }
-    .wrap { max-width: var(--w); margin: 14px auto; padding: 0 8px; }
-    h1 { font-size:18px; font-weight:600; margin: 6px 0 12px; }
-    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-    select, button { background:#111; color:#fff; border:1px solid #444; border-radius:8px; padding:10px 12px; font-size:14px; }
-    button.primary { border-color:#2ecc71; }
-    .hud { margin:8px 0 0; font-size:13px; color:#bfbfbf; }
-    .status { margin-top:6px; font-size:13px; color:#7dff7d; white-space:pre-wrap;}
-    video { display:none; }
-    canvas { display:block; width: var(--w); height: var(--h); background:#111; margin: 10px auto; }
-    .pill { display:inline-block; padding:4px 8px; border:1px solid #333; border-radius:999px; margin-left:6px; font-size:12px; color:#ccc;}
-  </style>
+<meta charset="UTF-8" />
+<title>HoverGreens Vision — Camera Boot</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
 
-  <!-- OpenCV: robust tracking in-browser (no native install) -->
-  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+<style>
+  body { margin:0; background:#000; color:#fff; font-family:Arial,sans-serif; }
+  .wrap { max-width:1180px; margin:20px auto; text-align:center; }
+  select, button { padding:10px 14px; font-size:16px; margin:6px; background:#111; color:#fff; border:1px solid #444; border-radius:6px; }
+  button.primary { border-color:#2ecc71; }
+  #status { margin-top:8px; font-size:14px; color:#0f0; white-space:pre-wrap; }
+  video { display:none; }
+  canvas { display:block; width:1180px; height:370px; margin:12px auto; background:#111; }
+</style>
+
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 </head>
 <body>
-  <div class="wrap">
-    <h1>HoverGreens Vision — Ball Tracer <span class="pill">Overhead</span><span class="pill">Solid Path</span></h1>
 
-    <div class="row">
-      <select id="cameraSelect" title="Choose camera"></select>
-      <button id="startCam" class="primary">Start Camera</button>
-      <button id="setStart">Set Start Area</button>
-      <button id="resetBtn">Reset</button>
-      <span class="hud" id="hudMsg">Step 1: Pick camera → Start. Step 2: Click “Set Start Area” (center then edge).</span>
-    </div>
-    <div class="status" id="status">Loading…</div>
+<div class="wrap">
+  <h2>HoverGreens Vision — Live Camera</h2>
 
-    <!-- Raw feed (hidden); we draw/process to canvases -->
-    <video id="cam" autoplay playsinline></video>
+  <select id="cameraSelect"></select>
+  <button id="startBtn" class="primary">Start Camera</button>
 
-    <!-- Display canvas (what user sees) -->
-    <canvas id="view" width="1180" height="370"></canvas>
-  </div>
+  <div id="status">Loading cameras…</div>
+
+  <video id="video" autoplay playsinline></video>
+  <canvas id="canvas" width="1180" height="370"></canvas>
+</div>
 
 <script>
-/* ---------- Elements & State ---------- */
-const camSel = document.getElementById('cameraSelect');
-const startCamBtn = document.getElementById('startCam');
-const setStartBtn  = document.getElementById('setStart');
-const resetBtn     = document.getElementById('resetBtn');
-const statusEl     = document.getElementById('status');
-const hudMsg       = document.getElementById('hudMsg');
-const video        = document.getElementById('cam');
-const view         = document.getElementById('view');
-const vtx          = view.getContext('2d');
+/* Elements */
+const camSelect = document.getElementById("cameraSelect");
+const startBtn  = document.getElementById("startBtn");
+const video     = document.getElementById("video");
+const canvas    = document.getElementById("canvas");
+const ctx       = canvas.getContext("2d");
+const statusEl  = document.getElementById("status");
 
-let cvReady = false;
-let processing = false;
+function setStatus(msg){ statusEl.textContent = msg; }
 
-let mode = 'idle';         // 'idle' | 'start'
-let startCircle = null;    // {x,y,r}
-let tracking = false;
-let path = [];             // [{x,y,t}]
-let last = null;           // {x,y,t}
-
-let procW = 640;           // processing resolution (scaled for speed)
-let procH = 200;           // will be set once camera starts
-let speedEMA = 0;          // smoothed speed (px/s)
-const emaAlpha = 0.25;
-let stillFrames = 0;
-const stopSpeed = 8;       // px/s threshold for 'stopped'
-const stopFrames = 12;     // consecutive frames below threshold to call stop
-
-/* ---------- Helpers ---------- */
-function log(line){ statusEl.textContent += `\n${line}`; }
-function set(line){ statusEl.textContent = line; }
-function now(){ return performance.now(); }
-function dist(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
-function scalePoint(px, py, fromW, fromH, toW, toH){
-  return { x: px * (toW/fromW), y: py * (toH/fromH) };
-}
-function insideStart(pt){
-  if(!startCircle) return false;
-  return Math.hypot(pt.x - startCircle.x, pt.y - startCircle.y) <= (startCircle.r + 3);
-}
-
-/* ---------- Camera: list + start ---------- */
-async function initCams(){
+/* ✅ Load camera list */
+async function loadCameras(){
   try {
     await navigator.mediaDevices.getUserMedia({video:true});
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cams = devices.filter(d => d.kind === "videoinput");
+
+    camSelect.innerHTML = "";
+    cams.forEach((cam,i)=>{
+      const opt = document.createElement("option");
+      opt.value = cam.deviceId;
+      opt.text  = cam.label || `Camera ${i+1}`;
+      camSelect.appendChild(opt);
+    });
+
+    setStatus("✅ Cameras detected — select one & click Start");
+
   } catch(e){
-    set('❌ Please allow camera access in the browser settings.');
-    throw e;
+    setStatus("❌ Camera permission required — enable in browser settings.");
   }
-  const devs = await navigator.mediaDevices.enumerateDevices();
-  const vids = devs.filter(d => d.kind === 'videoinput');
-  camSel.innerHTML = '';
-  vids.forEach((d,i)=>{
-    const o = document.createElement('option');
-    o.value = d.deviceId;
-    o.text  = d.label || `Camera ${i+1}`;
-    camSel.appendChild(o);
-  });
-  set('✅ Cameras available. Pick one and click “Start Camera”.');
 }
+loadCameras();
 
-async function startSelectedCamera(){
-  const id = camSel.value;
-  const stream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact:id } } });
-  video.srcObject = stream;
-  await video.play();
+/* ✅ Start selected camera */
+async function startCamera(){
+  const camId = camSelect.value;
+  setStatus("🎥 Starting camera…");
 
-  // pick processing height based on aspect ratio (match canvas 1180x370)
-  const vw = video.videoWidth, vh = video.videoHeight;
-  procW = 640; procH = Math.max(100, Math.round(procW * (vh/vw)));
-
-  set(`🎥 Camera streaming (${vw}×${vh}). Click “Set Start Area” → click center then edge of ball.`);
-}
-
-/* ---------- UI ---------- */
-setStartBtn.onclick = ()=>{ mode='start'; hudMsg.textContent='Click ball center, then click the ball edge to set radius.'; };
-resetBtn.onclick = ()=>{
-  tracking=false; path.length=0; last=null; stillFrames=0; speedEMA=0;
-  vtx.clearRect(0,0,view.width,view.height);
-  if(startCircle){
-    // redraw start circle after clear
-    vtx.strokeStyle='cyan'; vtx.lineWidth=2;
-    vtx.beginPath(); vtx.arc(startCircle.x, startCircle.y, startCircle.r, 0, Math.PI*2); vtx.stroke();
-  }
-  set('↺ Reset. Ready.');
-};
-view.addEventListener('click', (e)=>{
-  if(mode!=='start') return;
-  const rect = view.getBoundingClientRect();
-  const x = (e.clientX - rect.left) * (view.width/rect.width);
-  const y = (e.clientY - rect.top)  * (view.height/rect.height);
-
-  if(!startCircle){
-    startCircle = { x, y, r: 0 };
-    // draw as we go
-    vtx.strokeStyle='cyan'; vtx.lineWidth=2;
-    vtx.beginPath(); vtx.arc(startCircle.x, startCircle.y, 6, 0, Math.PI*2); vtx.stroke();
-    hudMsg.textContent='Now click the ball edge to set the start radius.';
-  } else if(startCircle && startCircle.r===0) {
-    startCircle.r = Math.max(8, Math.min(48, Math.hypot(x - startCircle.x, y - startCircle.y)));
-    vtx.strokeStyle='cyan'; vtx.lineWidth=2;
-    vtx.beginPath(); vtx.arc(startCircle.x, startCircle.y, startCircle.r, 0, Math.PI*2); vtx.stroke();
-    hudMsg.textContent='Start area set. Roll the ball — tracer begins when the ball leaves the circle.';
-    mode='idle';
-  }
-});
-
-startCamBtn.onclick = async ()=>{
   try {
-    await startSelectedCamera();
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video:{ deviceId:{ exact:camId }}
+    });
+
+    video.srcObject = stream;
+
+    await video.play().catch(()=>{});
+
+    video.onloadedmetadata = () => {
+      video.play();
+      setStatus(`✅ Camera streaming ${video.videoWidth}×${video.videoHeight}`);
+
+      // ✅ Start render loop once video is ready
+      requestAnimationFrame(drawLoop);
+    };
+
   } catch(e){
-    set('❌ Could not start camera. Check permissions and HTTPS.');
-    return;
-  }
-};
-
-/* ---------- Core Tracking (OpenCV) ---------- */
-let workCanvas, workCtx; // downscaled processing buffer
-
-function ensureWorkBuffer(){
-  if(!workCanvas){
-    workCanvas = document.createElement('canvas');
-    workCanvas.width  = procW;
-    workCanvas.height = procH;
-    workCtx = workCanvas.getContext('2d', { willReadFrequently:true });
+    console.error(e);
+    setStatus("❌ Camera failed to start");
   }
 }
 
-function drawOverlay(currentPt){
-  // redraw latest camera frame to view
-  vtx.drawImage(video, 0, 0, view.width, view.height);
-
-  // start circle
-  if(startCircle){
-    vtx.strokeStyle='cyan'; vtx.lineWidth=2;
-    vtx.beginPath(); vtx.arc(startCircle.x, startCircle.y, startCircle.r, 0, Math.PI*2); vtx.stroke();
+/* ✅ Draw loop — shows live video feed */
+function drawLoop(){
+  if (video.readyState === 4) {
+    ctx.drawImage(video,0,0,canvas.width,canvas.height);
   }
-
-  // path
-  if(path.length > 1){
-    vtx.lineWidth = 4;
-    vtx.strokeStyle = '#00FF7F';
-    vtx.beginPath();
-    vtx.moveTo(path[0].x, path[0].y);
-    for(let i=1;i<path.length;i++){
-      vtx.lineTo(path[i].x, path[i].y);
-    }
-    vtx.stroke();
-  }
-
-  // live ball mark
-  if(currentPt){
-    vtx.fillStyle = '#ffffff';
-    vtx.beginPath(); vtx.arc(currentPt.x, currentPt.y, 6, 0, Math.PI*2); vtx.fill();
-    vtx.strokeStyle = '#00FF7F'; vtx.lineWidth=2;
-    vtx.beginPath(); vtx.arc(currentPt.x, currentPt.y, 12, 0, Math.PI*2); vtx.stroke();
-  }
+  requestAnimationFrame(drawLoop);
 }
 
-function detectBallCenter() {
-  // Downscale for processing
-  workCtx.drawImage(video, 0, 0, procW, procH);
-
-  let src = cv.imread(workCanvas);               // RGBA
-  let hsv = new cv.Mat();
-  cv.cvtColor(src, hsv, cv.COLOR_RGBA2HSV);
-
-  // White mask tuned for indoor turf (H: all, S: low, V: high)
-  let low = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [0, 0, 195, 0]);
-  let high= new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [180, 60, 255, 255]);
-  let mask = new cv.Mat();
-  cv.inRange(hsv, low, high, mask);
-
-  // Clean mask (erode↓ noise, dilate↑ ball)
-  let k = cv.Mat.ones(3,3, cv.CV_8U);
-  cv.erode(mask, mask, k);
-  cv.dilate(mask, mask, k);
-  cv.GaussianBlur(mask, mask, new cv.Size(7,7), 1.5, 1.5);
-
-  // Try HoughCircles first
-  let circles = new cv.Mat();
-  cv.HoughCircles(mask, circles, cv.HOUGH_GRADIENT, 1, 30, 120, 18, 3, 60);
-  let center = null;
-
-  if (circles.cols > 0) {
-    // Take strongest circle
-    let x = circles.data32F[0], y = circles.data32F[1];
-    center = { x, y };
-  } else {
-    // Fallback: blob centroid (moments)
-    let contours = new cv.MatVector();
-    let hierarchy = new cv.Mat();
-    cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-    let largestArea=0, largestIdx=-1;
-    for (let i=0;i<contours.size();i++){
-      let area = cv.contourArea(contours.get(i));
-      if(area > largestArea){ largestArea=area; largestIdx=i; }
-    }
-    if(largestIdx >= 0 && largestArea > 60){
-      let m = cv.moments(contours.get(largestIdx));
-      if (m.m00 !== 0){
-        let cx = m.m10/m.m00, cy = m.m01/m.m00;
-        center = { x: cx, y: cy };
-      }
-    }
-    contours.delete(); hierarchy.delete();
-  }
-
-  // Cleanup
-  src.delete(); hsv.delete(); mask.delete(); low.delete(); high.delete(); circles.delete(); k.delete();
-
-  if(!center) return null;
-
-  // Scale back up to display canvas coordinates
-  return scalePoint(center.x, center.y, procW, procH, view.width, view.height);
-}
-
-function tick(){
-  if(!cvReady || video.readyState < 2){ requestAnimationFrame(tick); return; }
-  if(processing){ requestAnimationFrame(tick); return; }
-  processing = true;
-
-  ensureWorkBuffer();
-
-  const t = now();
-  const pt = detectBallCenter(); // returns display-space point or null
-
-  // Draw current frame & overlays
-  drawOverlay(pt);
-
-  // If start circle exists, control tracking by leaving it
-  if(startCircle && pt){
-    if(!tracking){
-      // Wait until ball leaves start circle
-      if(!insideStart(pt)){
-        tracking = true;
-        path.length = 0;
-        last = { x: pt.x, y: pt.y, t };
-        path.push(last);
-        set('▶️ Ball left start — tracing…');
-      }
-    } else {
-      // Tracing
-      const prev = last;
-      const dt = Math.max(1, t - prev.t) / 1000; // seconds
-      const d  = dist(pt, prev);
-      const sp = d / dt;                          // px/s
-
-      // smooth
-      speedEMA = emaAlpha*sp + (1-emaAlpha)*speedEMA;
-
-      // append if meaningful move (helps reduce noise)
-      if (d > 1.0) {
-        path.push({ x: pt.x, y: pt.y, t });
-        last = { x: pt.x, y: pt.y, t };
-      }
-
-      // stop detection
-      if(speedEMA < stopSpeed){
-        stillFrames++;
-        if(stillFrames >= stopFrames){
-          tracking = false;
-          stillFrames = 0;
-          set(`⛳ Stopped. Path length: ${path.length} points.`);
-          // Emphasize final point
-          if(path.length){
-            const end = path[path.length-1];
-            vtx.strokeStyle='#ff5252'; vtx.lineWidth=3;
-            vtx.beginPath(); vtx.arc(end.x, end.y, 10, 0, Math.PI*2); vtx.stroke();
-          }
-        }
-      } else {
-        stillFrames = 0;
-      }
-    }
-  }
-
-  processing = false;
-  requestAnimationFrame(tick);
-}
-
-/* ---------- OpenCV Init ---------- */
-if (typeof cv !== 'undefined'){
-  cv.onRuntimeInitialized = ()=>{
-    cvReady = true;
-    set('✅ OpenCV ready. Set start area, then roll a putt.');
-    requestAnimationFrame(tick);
-  };
-} else {
-  set('❌ OpenCV failed to load. Check network/HTTPS.');
-}
-
-/* ---------- Boot ---------- */
-initCams().catch(()=>{});
+/* Button binding */
+startBtn.onclick = startCamera;
 </script>
+
 </body>
 </html>
