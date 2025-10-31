@@ -2,14 +2,19 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>HoverGreens Vision — Tracer</title>
+<title>HoverGreens Vision — Ball Debug</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 
 <style>
   body { margin:0; background:black; color:white; font-family:Arial; text-align:center; }
   .wrap { width:1180px; margin:10px auto; }
   canvas { width:1180px; height:370px; background:#111; }
-  select,button { padding:10px 15px; margin:5px; background:#111; color:white; border:1px solid #555; border-radius:6px; font-size:16px; cursor:pointer; }
+  select,button {
+    padding:10px 15px; margin:5px;
+    background:#111; color:white;
+    border:1px solid #555; border-radius:6px;
+    font-size:16px; cursor:pointer;
+  }
   button.primary { border-color:#4cff70; }
   #log { font-size:14px; color:#0f0; min-height:20px; margin-top:8px; }
 </style>
@@ -18,13 +23,15 @@
 </head>
 
 <body>
+
 <div class="wrap">
-  <h2>HoverGreens Vision — Ball Tracer</h2>
+  <h2>HoverGreens Vision — Ball Detection Debug</h2>
 
   <select id="cams"></select>
   <button id="start" class="primary">Start Camera</button>
   <button id="setStart">Set Start Spot</button>
   <button id="reset">Reset</button>
+  <button id="debugBtn">Debug Ball View</button>
 
   <div id="log">Loading cameras…</div>
 
@@ -33,143 +40,92 @@
 </div>
 
 <script>
+/* DOM refs */
 const cams = document.getElementById("cams");
-const start = document.getElementById("start");
-const setStart = document.getElementById("setStart");
+const startBtn = document.getElementById("start");
+const setStartBtn = document.getElementById("setStart");
 const resetBtn = document.getElementById("reset");
+const debugBtn = document.getElementById("debugBtn");
 const log = t => document.getElementById("log").textContent = t;
+
 const video = document.getElementById("video");
 const canvas = document.getElementById("view");
 const ctx = canvas.getContext("2d");
 
-let startCircle=null;
-let waitingCenter=false, waitingEdge=false;
-let tracing=false;
-let path=[];
-let last={x:0,y:0,t:0};
-let cvReady=false, still=0, speedEMA=0;
+/* State */
+let debugMode = false;
+let cvReady = false;
+let startCircle = null;
+let waitingCenter = false, waitingEdge = false;
 
-/* CAMERA LIST */
+/* Get cameras */
 navigator.mediaDevices.getUserMedia({video:true}).then(async()=>{
   const devs = await navigator.mediaDevices.enumerateDevices();
   devs.filter(d=>d.kind==="videoinput").forEach((cam,i)=>{
     const opt=document.createElement("option");
-    opt.value=cam.deviceId; opt.text=cam.label||`Camera ${i+1}`;
+    opt.value=cam.deviceId;
+    opt.text=cam.label||`Camera ${i+1}`;
     cams.appendChild(opt);
   });
-  log("✅ Cameras ready — pick one");
+  log("✅ Cameras ready — choose one");
 });
 
-/* START CAMERA */
-start.onclick = async () => {
-  log("📷 Starting camera…");
+/* Start camera */
+startBtn.onclick = async ()=>{
   const stream = await navigator.mediaDevices.getUserMedia({
-    video:{ deviceId:{exact:cams.value}}
+    video:{deviceId:{exact:cams.value}}
   });
   video.srcObject = stream;
   await video.play().catch(()=>{});
 
-  log("✅ Camera live — click Set Start Spot");
+  log("✅ Camera streaming — click 'Set Start Spot'");
 
-  const draw = () => {
-    ctx.save();
-    ctx.scale(-1,1); // mirror
-    ctx.drawImage(video,-canvas.width,0,canvas.width,canvas.height);
-    ctx.restore();
-
-    if(startCircle){
-      ctx.strokeStyle="cyan"; ctx.lineWidth=2;
-      ctx.beginPath(); ctx.arc(startCircle.x,startCircle.y,startCircle.r,0,6.28); ctx.stroke();
-    }
-
-    if(cvReady){
-      let pt = detectBall();
-      if(pt){
-        ctx.fillStyle="#fff";
-        ctx.beginPath(); ctx.arc(pt.x,pt.y,6,0,6.28); ctx.fill();
-
-        if(startCircle && !tracing){
-          if(Math.hypot(pt.x-startCircle.x,pt.y-startCircle.y) > startCircle.r+2){
-            tracing=true;
-            path=[pt];
-            last={...pt,t:performance.now()};
-            log("🚀 Ball moving — tracing path");
-          }
-        }
-
-        if(tracing){
-          let now=performance.now();
-          let dt=(now-last.t)/1000;
-          let dist=Math.hypot(pt.x-last.x,pt.y-last.y);
-          let speed=dist/dt;
-          speedEMA = speed*0.2 + speedEMA*0.8;
-
-          if(dist > 0.8){
-            path.push(pt);
-            last={...pt,t:now};
-          }
-
-          if(speedEMA < 5){
-            still++;
-            if(still>12){
-              tracing=false;
-              const end=path[path.length-1];
-              ctx.strokeStyle="#ff4040";
-              ctx.lineWidth=3;
-              ctx.beginPath();
-              ctx.arc(end.x,end.y,10,0,6.28); ctx.stroke();
-              log("⛳ Ball stopped");
-            }
-          } else still=0;
-        }
-      }
-    }
-
-    if(path.length>1){
-      ctx.strokeStyle="#00ff80"; ctx.lineWidth=4;
-      ctx.beginPath();
-      ctx.moveTo(path[0].x,path[0].y);
-      for(let i=1;i<path.length;i++) ctx.lineTo(path[i].x,path[i].y);
-      ctx.stroke();
-    }
-
-    requestAnimationFrame(draw);
-  };
-  draw();
+  requestAnimationFrame(drawFrame);
 };
 
-/* SET START SPOT */
-setStart.onclick = ()=>{
-  waitingCenter=true; log("👆 Click ball center");
+/* Click-to-set start circle */
+setStartBtn.onclick = ()=>{
+  waitingCenter = true;
+  log("👆 Click ball CENTER");
 };
 
 canvas.onclick = e=>{
   if(!waitingCenter && !waitingEdge) return;
-  const r=canvas.getBoundingClientRect();
-  const x=(e.clientX-r.left)*(canvas.width/r.width);
-  const y=(e.clientY-r.top)*(canvas.height/r.height);
+
+  const r = canvas.getBoundingClientRect();
+  const x = (e.clientX - r.left) * (canvas.width/r.width);
+  const y = (e.clientY - r.top) * (canvas.height/r.height);
 
   if(waitingCenter){
-    startCircle={x,y,r:0};
-    waitingCenter=false; waitingEdge=true;
-    log("👆 Click ball edge");
-  } else if(waitingEdge){
-    startCircle.r=Math.hypot(x-startCircle.x,y-startCircle.y);
-    waitingEdge=false;
-    log("🟢 Start point set — roll when ready");
+    startCircle = {x,y,r:0};
+    waitingCenter = false;
+    waitingEdge = true;
+    log("👆 Click ball EDGE");
+  }
+  else if(waitingEdge){
+    startCircle.r = Math.hypot(x-startCircle.x,y-startCircle.y);
+    waitingEdge = false;
+    log("🟢 Start circle set — debug ball tracking");
   }
 };
 
-/* RESET */
+/* Reset */
 resetBtn.onclick = ()=>{
-  tracing=false; path=[]; still=0; speedEMA=0; startCircle=null;
+  startCircle=null;
   log("↺ Reset");
 };
 
-/* BALL DETECTOR */
+/* Toggle debug mode */
+debugBtn.onclick = ()=>{
+  debugMode = !debugMode;
+  log(debugMode ? "🐛 Debug ON — see ball mask + coords" : "✅ Debug OFF");
+};
+
+/* Ball detection */
 function detectBall(){
-  let src=new cv.Mat(canvas.height,canvas.width,cv.CV_8UC4);
+  let src = new cv.Mat(canvas.height,canvas.width,cv.CV_8UC4);
   new cv.VideoCapture(video).read(src);
+
   let hsv=new cv.Mat(); cv.cvtColor(src,hsv,cv.COLOR_RGBA2HSV);
   let low=new cv.Mat(hsv.rows,hsv.cols,hsv.type(),[0,0,185,0]);
   let high=new cv.Mat(hsv.rows,hsv.cols,hsv.type(),[180,60,255,255]);
@@ -178,23 +134,76 @@ function detectBall(){
   let cnts=new cv.MatVector(), hier=new cv.Mat();
   cv.findContours(mask,cnts,hier,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
 
-  let best=null, aMax=0;
+  let best=null, bestArea=0;
   for(let i=0;i<cnts.size();i++){
-    let a=cv.contourArea(cnts.get(i));
-    if(a > aMax){
-      aMax=a;
-      let m=cv.moments(cnts.get(i));
-      if(m.m00!==0) best={x:m.m10/m.m00, y:m.m01/m.m00};
+    let cnt=cnts.get(i);
+    let a=cv.contourArea(cnt);
+    if(a>bestArea){
+      bestArea=a;
+      let m=cv.moments(cnt);
+      if(m.m00!==0) best = {x:m.m10/m.m00, y:m.m01/m.m00};
     }
+  }
+
+  // show mask debug
+  if(debugMode){
+    const w=200, h=120;
+    let maskRGBA=new cv.Mat();
+    cv.cvtColor(mask,maskRGBA,cv.COLOR_GRAY2RGBA);
+    const imgData = new ImageData(
+      new Uint8ClampedArray(maskRGBA.data), maskRGBA.cols, maskRGBA.rows
+    );
+    let temp=document.createElement("canvas");
+    temp.width=maskRGBA.cols; temp.height=maskRGBA.rows;
+    temp.getContext("2d").putImageData(imgData,0,0);
+    ctx.drawImage(temp,canvas.width-w-10,10,w,h);
+    maskRGBA.delete();
   }
 
   src.delete(); hsv.delete(); low.delete(); high.delete(); mask.delete(); cnts.delete(); hier.delete();
   return best;
 }
 
-/* OPENCV LOADED */
-cv.onRuntimeInitialized = ()=>{ cvReady=true; log("✅ Vision engine loaded — ready") };
-</script>
+/* Draw each frame */
+function drawFrame(){
+  ctx.save();
+  ctx.scale(-1,1);
+  ctx.drawImage(video,-canvas.width,0,canvas.width,canvas.height);
+  ctx.restore();
 
+  // draw start circle
+  if(startCircle){
+    ctx.strokeStyle="cyan";
+    ctx.lineWidth=2;
+    ctx.beginPath();
+    ctx.arc(startCircle.x,startCircle.y,startCircle.r,0,6.28);
+    ctx.stroke();
+  }
+
+  if(cvReady){
+    const pt = detectBall();
+    if(pt){
+      // Big marker so we SEE ball
+      ctx.strokeStyle="#00eaff";
+      ctx.lineWidth=4;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, 14, 0, 6.28);
+      ctx.stroke();
+
+      ctx.fillStyle="#00eaff";
+      ctx.font="20px Arial";
+      ctx.fillText(`Ball: ${pt.x.toFixed(0)},${pt.y.toFixed(0)}`, 10, 25);
+    }
+  }
+
+  requestAnimationFrame(drawFrame);
+}
+
+/* OpenCV ready */
+cv.onRuntimeInitialized = ()=>{
+  cvReady = true;
+  log("✅ Vision engine loaded — debug ball now");
+};
+</script>
 </body>
 </html>
