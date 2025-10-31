@@ -2,26 +2,29 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>HoverGreens Vision Prototype</title>
+<title>HoverGreens Vision — Tracer</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 
 <style>
   body { margin:0; background:black; color:white; font-family:Arial; text-align:center; }
   .wrap { width:1180px; margin:10px auto; }
   canvas { width:1180px; height:370px; background:#111; }
-  select,button { padding:10px 15px; margin:5px; background:#111; color:white; border:1px solid #555; border-radius:6px; font-size:16px; }
+  select,button { padding:10px 15px; margin:5px; background:#111; color:white; border:1px solid #555; border-radius:6px; font-size:16px; cursor:pointer; }
   button.primary { border-color:#4cff70; }
   #log { font-size:14px; color:#0f0; min-height:20px; margin-top:8px; }
 </style>
+
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 </head>
 
 <body>
-
 <div class="wrap">
-  <h2>HoverGreens Vision</h2>
+  <h2>HoverGreens Vision — Ball Tracer</h2>
 
   <select id="cams"></select>
   <button id="start" class="primary">Start Camera</button>
+  <button id="setStart">Set Start Spot</button>
+  <button id="reset">Reset</button>
 
   <div id="log">Loading cameras…</div>
 
@@ -32,45 +35,165 @@
 <script>
 const cams = document.getElementById("cams");
 const start = document.getElementById("start");
+const setStart = document.getElementById("setStart");
+const resetBtn = document.getElementById("reset");
 const log = t => document.getElementById("log").textContent = t;
 const video = document.getElementById("video");
 const canvas = document.getElementById("view");
 const ctx = canvas.getContext("2d");
 
-// load cameras
-navigator.mediaDevices.getUserMedia({video:true}).then(async() => {
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  devices.filter(d => d.kind==="videoinput").forEach((cam,i)=>{
-    const opt = document.createElement("option");
-    opt.value = cam.deviceId;
-    opt.text = cam.label || `Camera ${i+1}`;
+let startCircle=null;
+let waitingCenter=false, waitingEdge=false;
+let tracing=false;
+let path=[];
+let last={x:0,y:0,t:0};
+let cvReady=false, still=0, speedEMA=0;
+
+/* CAMERA LIST */
+navigator.mediaDevices.getUserMedia({video:true}).then(async()=>{
+  const devs = await navigator.mediaDevices.enumerateDevices();
+  devs.filter(d=>d.kind==="videoinput").forEach((cam,i)=>{
+    const opt=document.createElement("option");
+    opt.value=cam.deviceId; opt.text=cam.label||`Camera ${i+1}`;
     cams.appendChild(opt);
   });
-  log("✅ Cameras ready — pick one, then Start");
+  log("✅ Cameras ready — pick one");
 });
 
-// start camera
-start.onclick = async() => {
+/* START CAMERA */
+start.onclick = async () => {
   log("📷 Starting camera…");
-
   const stream = await navigator.mediaDevices.getUserMedia({
     video:{ deviceId:{exact:cams.value}}
   });
   video.srcObject = stream;
   await video.play().catch(()=>{});
 
-  log("✅ Camera streaming live");
+  log("✅ Camera live — click Set Start Spot");
 
-  // draw loop
   const draw = () => {
     ctx.save();
-    ctx.scale(-1,1);
-    ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
+    ctx.scale(-1,1); // mirror
+    ctx.drawImage(video,-canvas.width,0,canvas.width,canvas.height);
     ctx.restore();
+
+    if(startCircle){
+      ctx.strokeStyle="cyan"; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(startCircle.x,startCircle.y,startCircle.r,0,6.28); ctx.stroke();
+    }
+
+    if(cvReady){
+      let pt = detectBall();
+      if(pt){
+        ctx.fillStyle="#fff";
+        ctx.beginPath(); ctx.arc(pt.x,pt.y,6,0,6.28); ctx.fill();
+
+        if(startCircle && !tracing){
+          if(Math.hypot(pt.x-startCircle.x,pt.y-startCircle.y) > startCircle.r+2){
+            tracing=true;
+            path=[pt];
+            last={...pt,t:performance.now()};
+            log("🚀 Ball moving — tracing path");
+          }
+        }
+
+        if(tracing){
+          let now=performance.now();
+          let dt=(now-last.t)/1000;
+          let dist=Math.hypot(pt.x-last.x,pt.y-last.y);
+          let speed=dist/dt;
+          speedEMA = speed*0.2 + speedEMA*0.8;
+
+          if(dist > 0.8){
+            path.push(pt);
+            last={...pt,t:now};
+          }
+
+          if(speedEMA < 5){
+            still++;
+            if(still>12){
+              tracing=false;
+              const end=path[path.length-1];
+              ctx.strokeStyle="#ff4040";
+              ctx.lineWidth=3;
+              ctx.beginPath();
+              ctx.arc(end.x,end.y,10,0,6.28); ctx.stroke();
+              log("⛳ Ball stopped");
+            }
+          } else still=0;
+        }
+      }
+    }
+
+    if(path.length>1){
+      ctx.strokeStyle="#00ff80"; ctx.lineWidth=4;
+      ctx.beginPath();
+      ctx.moveTo(path[0].x,path[0].y);
+      for(let i=1;i<path.length;i++) ctx.lineTo(path[i].x,path[i].y);
+      ctx.stroke();
+    }
+
     requestAnimationFrame(draw);
   };
   draw();
 };
+
+/* SET START SPOT */
+setStart.onclick = ()=>{
+  waitingCenter=true; log("👆 Click ball center");
+};
+
+canvas.onclick = e=>{
+  if(!waitingCenter && !waitingEdge) return;
+  const r=canvas.getBoundingClientRect();
+  const x=(e.clientX-r.left)*(canvas.width/r.width);
+  const y=(e.clientY-r.top)*(canvas.height/r.height);
+
+  if(waitingCenter){
+    startCircle={x,y,r:0};
+    waitingCenter=false; waitingEdge=true;
+    log("👆 Click ball edge");
+  } else if(waitingEdge){
+    startCircle.r=Math.hypot(x-startCircle.x,y-startCircle.y);
+    waitingEdge=false;
+    log("🟢 Start point set — roll when ready");
+  }
+};
+
+/* RESET */
+resetBtn.onclick = ()=>{
+  tracing=false; path=[]; still=0; speedEMA=0; startCircle=null;
+  log("↺ Reset");
+};
+
+/* BALL DETECTOR */
+function detectBall(){
+  let src=new cv.Mat(canvas.height,canvas.width,cv.CV_8UC4);
+  new cv.VideoCapture(video).read(src);
+  let hsv=new cv.Mat(); cv.cvtColor(src,hsv,cv.COLOR_RGBA2HSV);
+  let low=new cv.Mat(hsv.rows,hsv.cols,hsv.type(),[0,0,185,0]);
+  let high=new cv.Mat(hsv.rows,hsv.cols,hsv.type(),[180,60,255,255]);
+  let mask=new cv.Mat(); cv.inRange(hsv,low,high,mask);
+
+  let cnts=new cv.MatVector(), hier=new cv.Mat();
+  cv.findContours(mask,cnts,hier,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+
+  let best=null, aMax=0;
+  for(let i=0;i<cnts.size();i++){
+    let a=cv.contourArea(cnts.get(i));
+    if(a > aMax){
+      aMax=a;
+      let m=cv.moments(cnts.get(i));
+      if(m.m00!==0) best={x:m.m10/m.m00, y:m.m01/m.m00};
+    }
+  }
+
+  src.delete(); hsv.delete(); low.delete(); high.delete(); mask.delete(); cnts.delete(); hier.delete();
+  return best;
+}
+
+/* OPENCV LOADED */
+cv.onRuntimeInitialized = ()=>{ cvReady=true; log("✅ Vision engine loaded — ready") };
 </script>
 
 </body>
