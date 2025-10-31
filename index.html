@@ -96,7 +96,10 @@ async function startCamera(){
 /* ✅ Draw loop — shows live video feed */
 function drawLoop(){
   if (video.readyState === 4) {
-    ctx.drawImage(video,0,0,canvas.width,canvas.height);
+    ctx.save();
+      ctx.scale(-1, 1);
+      ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
+      ctx.restore();
   }
   requestAnimationFrame(drawLoop);
 }
