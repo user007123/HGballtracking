@@ -2,11 +2,11 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>HoverGreens Vision — Ball Debug</title>
+<title>HoverGreens Vision — Ball Debug Mode</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 
 <style>
-  body { margin:0; background:black; color:white; font-family:Arial; text-align:center; }
+  body { margin:0; background:black; color:white; font-family:Arial; text-align:center;}
   .wrap { width:1180px; margin:10px auto; }
   canvas { width:1180px; height:370px; background:#111; }
   select,button {
@@ -23,9 +23,8 @@
 </head>
 
 <body>
-
 <div class="wrap">
-  <h2>HoverGreens Vision — Ball Detection Debug</h2>
+  <h2>HoverGreens Vision — BALL DEBUG MODE</h2>
 
   <select id="cams"></select>
   <button id="start" class="primary">Start Camera</button>
@@ -40,7 +39,6 @@
 </div>
 
 <script>
-/* DOM refs */
 const cams = document.getElementById("cams");
 const startBtn = document.getElementById("start");
 const setStartBtn = document.getElementById("setStart");
@@ -52,13 +50,13 @@ const video = document.getElementById("video");
 const canvas = document.getElementById("view");
 const ctx = canvas.getContext("2d");
 
-/* State */
 let debugMode = false;
 let cvReady = false;
-let startCircle = null;
-let waitingCenter = false, waitingEdge = false;
 
-/* Get cameras */
+let startCircle=null;
+let waitingCenter=false, waitingEdge=false;
+
+/* ---- CAMERA LOAD ---- */
 navigator.mediaDevices.getUserMedia({video:true}).then(async()=>{
   const devs = await navigator.mediaDevices.enumerateDevices();
   devs.filter(d=>d.kind==="videoinput").forEach((cam,i)=>{
@@ -67,10 +65,10 @@ navigator.mediaDevices.getUserMedia({video:true}).then(async()=>{
     opt.text=cam.label||`Camera ${i+1}`;
     cams.appendChild(opt);
   });
-  log("✅ Cameras ready — choose one");
+  log("✅ Cameras ready — choose & Start");
 });
 
-/* Start camera */
+/* ---- START CAMERA ---- */
 startBtn.onclick = async ()=>{
   const stream = await navigator.mediaDevices.getUserMedia({
     video:{deviceId:{exact:cams.value}}
@@ -78,132 +76,110 @@ startBtn.onclick = async ()=>{
   video.srcObject = stream;
   await video.play().catch(()=>{});
 
-  log("✅ Camera streaming — click 'Set Start Spot'");
-
+  log("✅ Camera Live — Set Start Spot then Debug Ball Mode");
   requestAnimationFrame(drawFrame);
 };
 
-/* Click-to-set start circle */
-setStartBtn.onclick = ()=>{
-  waitingCenter = true;
-  log("👆 Click ball CENTER");
-};
+/* ---- SET START ---- */
+setStartBtn.onclick = ()=>{ waitingCenter=true; log("👆 Click ball CENTER"); };
 
 canvas.onclick = e=>{
   if(!waitingCenter && !waitingEdge) return;
 
   const r = canvas.getBoundingClientRect();
-  const x = (e.clientX - r.left) * (canvas.width/r.width);
-  const y = (e.clientY - r.top) * (canvas.height/r.height);
+  const x = (e.clientX-r.left)*(canvas.width/r.width);
+  const y = (e.clientY-r.top)*(canvas.height/r.height);
 
   if(waitingCenter){
-    startCircle = {x,y,r:0};
-    waitingCenter = false;
-    waitingEdge = true;
+    startCircle={x,y,r:0};
+    waitingCenter=false; waitingEdge=true;
     log("👆 Click ball EDGE");
-  }
-  else if(waitingEdge){
-    startCircle.r = Math.hypot(x-startCircle.x,y-startCircle.y);
-    waitingEdge = false;
-    log("🟢 Start circle set — debug ball tracking");
+  } else {
+    startCircle.r=Math.hypot(x-startCircle.x,y-startCircle.y);
+    waitingEdge=false;
+    log("🟢 Start spot locked — turn on Debug Ball View");
   }
 };
 
-/* Reset */
-resetBtn.onclick = ()=>{
-  startCircle=null;
-  log("↺ Reset");
-};
+/* ---- RESET ---- */
+resetBtn.onclick = ()=>{ startCircle=null; log("↺ Reset"); };
 
-/* Toggle debug mode */
+/* ---- DEBUG TOGGLE ---- */
 debugBtn.onclick = ()=>{
-  debugMode = !debugMode;
-  log(debugMode ? "🐛 Debug ON — see ball mask + coords" : "✅ Debug OFF");
+  debugMode=!debugMode;
+  log(debugMode?"🐛 DEBUG ON — showing mask":"✅ Debug Off");
 };
 
-/* Ball detection */
+/* ---- RAW BALL DETECTOR ---- */
 function detectBall(){
   let src = new cv.Mat(canvas.height,canvas.width,cv.CV_8UC4);
   new cv.VideoCapture(video).read(src);
 
-  let hsv=new cv.Mat(); cv.cvtColor(src,hsv,cv.COLOR_RGBA2HSV);
-  let low=new cv.Mat(hsv.rows,hsv.cols,hsv.type(),[0,0,185,0]);
-  let high=new cv.Mat(hsv.rows,hsv.cols,hsv.type(),[180,60,255,255]);
-  let mask=new cv.Mat(); cv.inRange(hsv,low,high,mask);
+  let gray=new cv.Mat(); cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
+  let mask=new cv.Mat(); cv.threshold(gray,mask,150,255,cv.THRESH_BINARY);
 
   let cnts=new cv.MatVector(), hier=new cv.Mat();
   cv.findContours(mask,cnts,hier,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
 
-  let best=null, bestArea=0;
+  let best=null, maxA=0;
   for(let i=0;i<cnts.size();i++){
-    let cnt=cnts.get(i);
-    let a=cv.contourArea(cnt);
-    if(a>bestArea){
-      bestArea=a;
-      let m=cv.moments(cnt);
-      if(m.m00!==0) best = {x:m.m10/m.m00, y:m.m01/m.m00};
+    let c=cnts.get(i); let a=cv.contourArea(c);
+    if(a>maxA){
+      maxA=a;
+      let m=cv.moments(c);
+      if(m.m00!==0) best={x:m.m10/m.m00, y:m.m01/m.m00};
     }
   }
 
-  // show mask debug
+  // mask preview
   if(debugMode){
-    const w=200, h=120;
-    let maskRGBA=new cv.Mat();
-    cv.cvtColor(mask,maskRGBA,cv.COLOR_GRAY2RGBA);
-    const imgData = new ImageData(
+    let maskRGBA = new cv.Mat();
+    cv.cvtColor(mask, maskRGBA, cv.COLOR_GRAY2RGBA);
+
+    const w=200,h=120;
+    const img = new ImageData(
       new Uint8ClampedArray(maskRGBA.data), maskRGBA.cols, maskRGBA.rows
     );
-    let temp=document.createElement("canvas");
-    temp.width=maskRGBA.cols; temp.height=maskRGBA.rows;
-    temp.getContext("2d").putImageData(imgData,0,0);
-    ctx.drawImage(temp,canvas.width-w-10,10,w,h);
+    let tmp=document.createElement("canvas");
+    tmp.width=maskRGBA.cols; tmp.height=maskRGBA.rows;
+    tmp.getContext("2d").putImageData(img,0,0);
+    ctx.drawImage(tmp, canvas.width-w-10, 10, w, h);
+
     maskRGBA.delete();
   }
 
-  src.delete(); hsv.delete(); low.delete(); high.delete(); mask.delete(); cnts.delete(); hier.delete();
+  src.delete(); gray.delete(); mask.delete(); cnts.delete(); hier.delete();
   return best;
 }
 
-/* Draw each frame */
+/* ---- FRAME LOOP ---- */
 function drawFrame(){
   ctx.save();
   ctx.scale(-1,1);
   ctx.drawImage(video,-canvas.width,0,canvas.width,canvas.height);
   ctx.restore();
 
-  // draw start circle
   if(startCircle){
-    ctx.strokeStyle="cyan";
-    ctx.lineWidth=2;
-    ctx.beginPath();
-    ctx.arc(startCircle.x,startCircle.y,startCircle.r,0,6.28);
-    ctx.stroke();
+    ctx.strokeStyle="cyan"; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.arc(startCircle.x,startCircle.y,startCircle.r,0,6.28); ctx.stroke();
   }
 
   if(cvReady){
-    const pt = detectBall();
+    let pt = detectBall();
     if(pt){
-      // Big marker so we SEE ball
-      ctx.strokeStyle="#00eaff";
-      ctx.lineWidth=4;
-      ctx.beginPath();
-      ctx.arc(pt.x, pt.y, 14, 0, 6.28);
-      ctx.stroke();
+      ctx.strokeStyle="#00eaff"; ctx.lineWidth=4;
+      ctx.beginPath(); ctx.arc(pt.x,pt.y,14,0,6.28); ctx.stroke();
 
-      ctx.fillStyle="#00eaff";
-      ctx.font="20px Arial";
-      ctx.fillText(`Ball: ${pt.x.toFixed(0)},${pt.y.toFixed(0)}`, 10, 25);
+      ctx.fillStyle="#00eaff"; ctx.font="20px Arial";
+      ctx.fillText(`Ball: ${pt.x.toFixed(0)},${pt.y.toFixed(0)}`,10,25);
     }
   }
 
   requestAnimationFrame(drawFrame);
 }
 
-/* OpenCV ready */
-cv.onRuntimeInitialized = ()=>{
-  cvReady = true;
-  log("✅ Vision engine loaded — debug ball now");
-};
+/* ---- OPENCV READY ---- */
+cv.onRuntimeInitialized = ()=>{ cvReady=true; log("✅ CV Ready — debug ball now"); };
 </script>
 </body>
 </html>
