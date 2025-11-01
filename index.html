@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>HoverGreens Ball Vision — Boot Test</title>
+<title>HoverGreens Vision Boot Test</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 
 <style>
@@ -11,16 +11,15 @@
   video, canvas { width:1180px; height:370px; background:#111; display:block; margin:10px auto; }
 </style>
 
-<!-- ✅ Load OpenCV FIRST — no async -->
-<script src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.7.0/dist/opencv.js"></script>
-
+<!-- ✅ Reliable OpenCV CDN (no local wasm needed) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/opencv/4.5.2/opencv.js"></script>
 <script>
 let cvReady = false;
 
 cv['onRuntimeInitialized'] = () => {
   cvReady = true;
-  const box = document.getElementById("status");
-  box.textContent = "✅ OpenCV Ready — drawing enabled";
+  const statusBox = document.getElementById("status");
+  statusBox.textContent = "✅ OpenCV Ready — drawing enabled";
   if (typeof loop === "function") requestAnimationFrame(loop);
 };
 </script>
@@ -28,7 +27,7 @@ cv['onRuntimeInitialized'] = () => {
 </head>
 <body>
 
-<h2>HoverGreens Vision — Camera + OpenCV Boot</h2>
+<h2>HoverGreens Vision — Camera + OpenCV Test</h2>
 <div id="status">⏳ Initializing camera & OpenCV…</div>
 
 <video id="cam" autoplay playsinline></video>
@@ -41,25 +40,25 @@ const canvas = document.getElementById("view");
 const ctx = canvas.getContext("2d");
 
 // ✅ Start camera
-navigator.mediaDevices.getUserMedia({ video:true })
+navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }})
 .then(stream => {
   video.srcObject = stream;
   video.onloadedmetadata = () => video.play();
   statusBox.textContent = "📷 Camera started — waiting for OpenCV…";
 })
-.catch(err => {
+.catch(() => {
   statusBox.textContent = "❌ Camera blocked — enable permissions";
 });
 
-// ✅ Draw loop — runs ONLY after OpenCV ready
+// ✅ Draw loop (runs once OpenCV loads)
 function loop() {
-  // draw mirrored cam feed
+  // draw mirrored camera feed
   ctx.save();
   ctx.scale(-1,1);
   ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
   ctx.restore();
 
-  // ✅ debug dot — PROVES drawing works
+  // ✅ debug dot — proves rendering works
   ctx.fillStyle = "white";
   ctx.beginPath();
   ctx.arc(50, 50, 12, 0, Math.PI*2);
