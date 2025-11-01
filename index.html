@@ -1,68 +1,62 @@
 <!DOCTYPE html>
 <html>
 <head>
-<title>HoverGreens Ball Vision</title>
+<title>HoverGreens Ball Tracking</title>
 <style>
   body {
-    margin: 0;
-    background: #000;
-    color: white;
-    font-family: Arial, sans-serif;
-    text-align: center;
+    margin:0;
+    background:black;
+    color:white;
+    font-family:Arial, sans-serif;
+    text-align:center;
   }
   #canvas {
-    display: block;
-    margin: auto;
+    display:block;
+    margin:auto;
   }
   #status {
-    margin-top: 10px;
-    font-size: 22px;
+    font-size:22px;
+    margin-top:8px;
   }
 </style>
 </head>
-<body>
 
+<body>
 <video id="video" autoplay playsinline style="display:none;"></video>
 <canvas id="canvas"></canvas>
 <div id="status">🟢 Loading OpenCV…</div>
 
-<!-- ✅ Load local opencv.js file -->
+<!-- ✅ Use YOUR local opencv.js file in GitHub -->
 <script src="opencv.js"></script>
 
 <script>
-// DOM references
 const video = document.getElementById("video");
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
 
-let cap, src, gray, circles;
-let ready = false;
+let cap, frame, fgmask, mog;
+let lastBall = {x:null, y:null};
+let ballWasMoving = false;
 
-// ✅ Start camera
 function startCamera() {
   navigator.mediaDevices.getUserMedia({
-    video: { facingMode: "environment" },
+    video: { facingMode:"environment" },
     audio: false
   })
   .then(stream => {
     video.srcObject = stream;
 
     video.onloadedmetadata = () => {
-      video.play(); // force autoplay
-
-      // match canvas to camera feed size
-      canvas.width = video.videoWidth;
+      video.play();
+      canvas.width  = video.videoWidth;
       canvas.height = video.videoHeight;
 
-      // OpenCV buffers
-      src = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
-      gray = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC1);
-      circles = new cv.Mat();
-      cap = new cv.VideoCapture(video);
+      frame  = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
+      fgmask = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC1);
+      mog = new cv.BackgroundSubtractorMOG2(200, 25, false);
 
-      ready = true;
-      document.getElementById("status").textContent =
-        "📷 Camera started — place ball on green";
+      cap = new cv.VideoCapture(video);
+      document.getElementById("status").textContent = "📷 Camera ready — roll ball";
       requestAnimationFrame(loop);
     };
   })
@@ -71,68 +65,70 @@ function startCamera() {
   });
 }
 
-// ✅ Circle detection
-function detectBallCircle(frame) {
-  cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY);
-  cv.GaussianBlur(gray, gray, new cv.Size(9, 9), 2, 2);
-
-  circles = new cv.Mat();
-
-  cv.HoughCircles(
-    gray, circles, cv.HOUGH_GRADIENT,
-    1, 20,
-    100, 15,
-    8, 40 // tuned for overhead golf ball
-  );
-
-  if (circles.rows > 0) {
-    return {
-      x: circles.data32F[0],
-      y: circles.data32F[1],
-      r: circles.data32F[2]
-    };
-  }
-
-  return null;
-}
-
-// ✅ Main loop
 function loop() {
-  if (!ready || video.videoWidth === 0) {
+  // draw video frame
+  ctx.drawImage(video, 0,0, canvas.width, canvas.height);
+  
+  try { cap.read(frame); } catch(e) {
     requestAnimationFrame(loop);
     return;
   }
 
-  // draw camera feed to canvas first
-  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  // background subtractor to find motion
+  mog.apply(frame, fgmask);
+  cv.threshold(fgmask, fgmask, 200, 255, cv.THRESH_BINARY);
+  cv.morphologyEx(fgmask, fgmask, cv.MORPH_OPEN, cv.Mat.ones(5,5,cv.CV_8U));
 
-  // read pixels into OpenCV buffer
-  try {
-    cap.read(src);
-  } catch (e) {
-    requestAnimationFrame(loop);
-    return;
+  // find moving blob = ball
+  let contours = new cv.MatVector();
+  let hierarchy = new cv.Mat();
+  cv.findContours(fgmask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+  let bestArea = 0, bx = null, by = null;
+
+  for (let i = 0; i < contours.size(); i++) {
+    let cnt  = contours.get(i);
+    let area = cv.contourArea(cnt);
+
+    if (area > 25 && area < 2000 && area > bestArea) {
+      let rect = cv.boundingRect(cnt);
+      bx = rect.x + rect.width / 2;
+      by = rect.y + rect.height / 2;
+      bestArea = area;
+    }
   }
 
-  let ball = detectBallCircle(src);
+  if (bx && by) {
+    ballWasMoving = true;
+    lastBall = { x:bx, y:by };
 
-  if (ball) {
     ctx.beginPath();
-    ctx.lineWidth = 4;
-    ctx.strokeStyle = "cyan";
-    ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
-    ctx.stroke();
+    ctx.arc(bx, by, 6, 0, Math.PI*2);
+    ctx.fillStyle = "lime";
+    ctx.fill();
 
-    document.getElementById("status").textContent = "✅ Ball detected!";
+    document.getElementById("status").textContent = "🏃 Ball moving…";
+  }
+  else if (ballWasMoving) {
+    ballWasMoving = false;
+
+    if (lastBall.x) {
+      ctx.beginPath();
+      ctx.arc(lastBall.x, lastBall.y, 12, 0, Math.PI*2);
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = "cyan";
+      ctx.stroke();
+
+      document.getElementById("status").textContent = "⛳ Ball stopped — position locked";
+    }
   }
 
   requestAnimationFrame(loop);
 }
 
-// ✅ OpenCV ready
+// ✅ When OpenCV is ready, start
 cv.onRuntimeInitialized = () => {
-  document.getElementById("status").textContent =
-    "✅ OpenCV loaded — starting camera…";
+  document.getElementById("status").textContent = "✅ OpenCV ready — activating camera";
   startCamera();
 };
 </script>
