@@ -2,58 +2,69 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>HoverGreens — CV Boot Test</title>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>HoverGreens Ball Vision Boot Test</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
 <style>
-  body { background:black; color:white; text-align:center; font-family:Arial;}
-  #status { margin:10px; font-size:18px; }
-  video, canvas { width:1180px; height:370px; background:#111; display:block; margin:auto;}
+  body { margin:0; background:#000; color:#fff; font-family:Arial; text-align:center; }
+  #status { font-size:18px; padding:8px; }
+  video, canvas { width:1180px; height:370px; background:#111; display:block; margin:10px auto; }
 </style>
-<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+
+<!-- ✅ OpenCV CDN — no local wasm needed -->
+<script async src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.7.0/dist/opencv.js"></script>
+
 </head>
 <body>
 
-<h2>HoverGreens Vision — OpenCV Boot Test</h2>
-<div id="status">Booting OpenCV…</div>
+<h2>HoverGreens Ball Vision — Camera Test</h2>
+<div id="status">⏳ Loading OpenCV & camera…</div>
 
-<video id="v" autoplay playsinline></video>
-<canvas id="c" width="1180" height="370"></canvas>
+<video id="cam" autoplay playsinline></video>
+<canvas id="view" width="1180" height="370"></canvas>
 
 <script>
-const statusEl=document.getElementById("status");
-const video=document.getElementById("v");
-const canvas=document.getElementById("c");
-const ctx=canvas.getContext("2d");
+let cvReady = false;
+const statusBox = document.getElementById("status");
+const video = document.getElementById("cam");
+const canvas = document.getElementById("view");
+const ctx = canvas.getContext("2d");
 
-statusEl.textContent="Requesting camera…";
-
-navigator.mediaDevices.getUserMedia({video:true}).then(stream=>{
-  video.srcObject=stream;
-  video.onloadedmetadata=()=>video.play();
-  statusEl.textContent="Camera ready — waiting for OpenCV…";
-}).catch(_=>{
-  statusEl.textContent="Camera blocked. Allow permission.";
+// ✅ Start camera
+navigator.mediaDevices.getUserMedia({ video:true })
+.then(stream => {
+  video.srcObject = stream;
+  video.onloadedmetadata = () => video.play();
+  statusBox.textContent = "📷 Camera started — waiting for OpenCV…";
+})
+.catch(err => {
+  statusBox.textContent = "❌ Camera blocked — allow camera in browser";
 });
 
-function loop(){
+// ✅ OpenCV Ready callback
+cv.onRuntimeInitialized = () => {
+  cvReady = true;
+  statusBox.textContent = "✅ OpenCV Ready — drawing enabled";
+  loop();
+};
+
+// ✅ Draw loop
+function loop() {
+  // draw mirrored camera feed
   ctx.save();
-  ctx.scale(-1,1);
-  ctx.drawImage(video,-canvas.width,0,canvas.width,canvas.height);
+  ctx.scale(-1, 1);
+  ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
   ctx.restore();
 
-  // small white dot to prove drawing works
-  ctx.fillStyle="white";
+  // ✅ debug dot (proves draw loop works)
+  ctx.fillStyle = "white";
   ctx.beginPath();
-  ctx.arc(50,50,10,0,Math.PI*2);
+  ctx.arc(40, 40, 12, 0, Math.PI*2);
   ctx.fill();
 
   requestAnimationFrame(loop);
 }
-
-cv.onRuntimeInitialized = ()=>{
-  statusEl.textContent="✅ OpenCV Ready — drawing enabled";
-  loop();
-};
 </script>
+
 </body>
 </html>
