@@ -1,11 +1,23 @@
 <!DOCTYPE html>
 <html>
 <head>
-<title>HoverGreens Ball Detector</title>
+<title>HoverGreens Ball Vision</title>
 <style>
-  body { margin:0; background:#000; color:white; font-family:Arial; text-align:center; }
-  #canvas { display:block; margin:auto; }
-  #status { font-size:22px; margin-top:10px; }
+  body {
+    margin: 0;
+    background: #000;
+    color: white;
+    font-family: Arial, sans-serif;
+    text-align: center;
+  }
+  #canvas {
+    display: block;
+    margin: auto;
+  }
+  #status {
+    margin-top: 10px;
+    font-size: 22px;
+  }
 </style>
 </head>
 <body>
@@ -14,34 +26,43 @@
 <canvas id="canvas"></canvas>
 <div id="status">🟢 Loading OpenCV…</div>
 
+<!-- ✅ Load local opencv.js file -->
 <script src="opencv.js"></script>
 
 <script>
-let video = document.getElementById("video");
-let canvas = document.getElementById("canvas");
-let ctx = canvas.getContext("2d");
+// DOM references
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
 
 let cap, src, gray, circles;
 let ready = false;
 
 // ✅ Start camera
 function startCamera() {
-  navigator.mediaDevices.getUserMedia({ video: { facingMode:"environment" }})
+  navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment" },
+    audio: false
+  })
   .then(stream => {
     video.srcObject = stream;
 
     video.onloadedmetadata = () => {
+      video.play(); // force autoplay
+
+      // match canvas to camera feed size
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
 
-      // ✅ Initialize OpenCV mats AFTER video size exists
+      // OpenCV buffers
       src = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
       gray = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC1);
       circles = new cv.Mat();
       cap = new cv.VideoCapture(video);
 
       ready = true;
-      document.getElementById("status").textContent = "📷 Camera started — place ball on green";
+      document.getElementById("status").textContent =
+        "📷 Camera started — place ball on green";
       requestAnimationFrame(loop);
     };
   })
@@ -50,51 +71,56 @@ function startCamera() {
   });
 }
 
-// ✅ Circle-based golf ball detection
+// ✅ Circle detection
 function detectBallCircle(frame) {
   cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY);
-  cv.GaussianBlur(gray, gray, new cv.Size(9,9), 2,2);
+  cv.GaussianBlur(gray, gray, new cv.Size(9, 9), 2, 2);
 
   circles = new cv.Mat();
 
   cv.HoughCircles(
     gray, circles, cv.HOUGH_GRADIENT,
     1, 20,
-    100, 15,  // detection thresholds
-    8, 40     // min/max radius in px (overhead tuned)
+    100, 15,
+    8, 40 // tuned for overhead golf ball
   );
 
   if (circles.rows > 0) {
-    let x = circles.data32F[0];
-    let y = circles.data32F[1];
-    let r = circles.data32F[2];
-    return { x, y, r };
+    return {
+      x: circles.data32F[0],
+      y: circles.data32F[1],
+      r: circles.data32F[2]
+    };
   }
 
   return null;
 }
 
-// ✅ Safe frame loop
+// ✅ Main loop
 function loop() {
-  // wait for video frames
   if (!ready || video.videoWidth === 0) {
     requestAnimationFrame(loop);
     return;
   }
 
-  try { cap.read(src); } catch(e) {
+  // draw camera feed to canvas first
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  // read pixels into OpenCV buffer
+  try {
+    cap.read(src);
+  } catch (e) {
     requestAnimationFrame(loop);
     return;
   }
 
-  cv.imshow(canvas, src);
-
   let ball = detectBallCircle(src);
+
   if (ball) {
     ctx.beginPath();
     ctx.lineWidth = 4;
     ctx.strokeStyle = "cyan";
-    ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI*2);
+    ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
     ctx.stroke();
 
     document.getElementById("status").textContent = "✅ Ball detected!";
@@ -103,12 +129,12 @@ function loop() {
   requestAnimationFrame(loop);
 }
 
-// ✅ OpenCV ready → start camera
-cv['onRuntimeInitialized'] = () => {
-  document.getElementById("status").textContent = "✅ OpenCV loaded — starting camera…";
+// ✅ OpenCV ready
+cv.onRuntimeInitialized = () => {
+  document.getElementById("status").textContent =
+    "✅ OpenCV loaded — starting camera…";
   startCamera();
 };
 </script>
-
 </body>
 </html>
