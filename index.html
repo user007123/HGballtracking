@@ -1,136 +1,276 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<title>HoverGreens Ball Tracking</title>
+<meta charset="UTF-8" />
+<title>HoverGreens – Motion Ball Tracer (30fps)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
 <style>
-  body {
-    margin:0;
-    background:black;
-    color:white;
-    font-family:Arial, sans-serif;
-    text-align:center;
-  }
-  #canvas {
-    display:block;
-    margin:auto;
-  }
-  #status {
-    font-size:22px;
-    margin-top:8px;
-  }
+  :root { color-scheme: dark; }
+  body { margin:0; background:#000; color:#fff; font-family:Arial, sans-serif; text-align:center; }
+  h2 { margin:10px 0 6px; font-size:20px; }
+  #status { font-size:14px; color:#7dff7d; min-height:20px; margin:6px 0 8px; }
+  .row { display:flex; justify-content:center; gap:10px; flex-wrap:wrap; margin:6px 0; }
+  button { background:#111; color:#fff; border:1px solid #444; border-radius:8px; padding:8px 14px; cursor:pointer; }
+  button:hover { border-color:#4cff70; }
+  label { font-size:12px; color:#bbb; }
+  input[type="range"] { width:120px; vertical-align:middle; }
+  video { display:none; }
+  canvas { display:block; margin:8px auto; background:#000; }
+  #view { width:1180px; height:370px; }
+  #mask { position:absolute; right:14px; top:14px; width:220px; height:124px; border:1px solid #333; display:none; }
+  .stage { position:relative; width:1180px; margin:0 auto; }
+  .hint { color:#bbb; font-size:12px; margin-top:-2px; }
 </style>
 </head>
-
 <body>
-<video id="video" autoplay playsinline style="display:none;"></video>
-<canvas id="canvas"></canvas>
-<div id="status">🟢 Loading OpenCV…</div>
 
-<!-- ✅ Use YOUR local opencv.js file in GitHub -->
-<script src="opencv.js"></script>
+<h2>HoverGreens — Motion Ball Tracer</h2>
+
+<div class="row">
+  <button id="resetBtn">Reset</button>
+  <button id="debugBtn">Debug</button>
+  <label>Diff<span id="dVal">18</span>
+    <input id="diff" type="range" min="5" max="60" step="1" value="18" />
+  </label>
+  <label>MinArea<span id="minVal">80</span>
+    <input id="minA" type="range" min="20" max="400" step="5" value="80" />
+  </label>
+  <label>MaxArea<span id="maxVal">1200</span>
+    <input id="maxA" type="range" min="300" max="4000" step="50" value="1200" />
+  </label>
+</div>
+<div class="hint">Put ball on the green, roll it — green line traces while moving, cyan ring appears when it stops.</div>
+<div id="status">⏳ Starting camera…</div>
+
+<video id="cam" autoplay playsinline muted></video>
+
+<div class="stage">
+  <canvas id="view" width="1180" height="370"></canvas>
+  <canvas id="mask" width="220" height="124"></canvas>
+</div>
 
 <script>
-const video = document.getElementById("video");
-const canvas = document.getElementById("canvas");
-const ctx = canvas.getContext("2d");
+const statusBox = document.getElementById('status');
+const video = document.getElementById('cam');
 
-let cap, frame, fgmask, mog;
-let lastBall = {x:null, y:null};
-let ballWasMoving = false;
+// Display canvas (projection size)
+const view = document.getElementById('view');
+const vctx = view.getContext('2d', { willReadFrequently:true });
 
-function startCamera() {
-  navigator.mediaDevices.getUserMedia({
-    video: { facingMode:"environment" },
-    audio: false
-  })
-  .then(stream => {
-    video.srcObject = stream;
+// Small debug mask
+const mask = document.getElementById('mask');
+const mctx = mask.getContext('2d', { willReadFrequently:true });
 
-    video.onloadedmetadata = () => {
-      video.play();
-      canvas.width  = video.videoWidth;
-      canvas.height = video.videoHeight;
+// Processing canvas (lower res for speed)
+const proc = document.createElement('canvas');
+const pctx = proc.getContext('2d', { willReadFrequently:true });
 
-      frame  = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
-      fgmask = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC1);
-      mog = new cv.BackgroundSubtractorMOG2(200, 25, false);
+// UI
+const diff = document.getElementById('diff');
+const minA = document.getElementById('minA');
+const maxA = document.getElementById('maxA');
+const dVal = document.getElementById('dVal');
+const minVal = document.getElementById('minVal');
+const maxVal = document.getElementById('maxVal');
 
-      cap = new cv.VideoCapture(video);
-      document.getElementById("status").textContent = "📷 Camera ready — roll ball";
-      requestAnimationFrame(loop);
-    };
-  })
-  .catch(err => {
-    document.getElementById("status").textContent = "❌ Camera error: " + err;
-  });
+[diff,minA,maxA].forEach(inp=>{
+  const map={diff:dVal,minA:minVal,maxA:maxVal}[inp.id];
+  const upd=()=>map.textContent=' ' + inp.value;
+  inp.oninput=upd; upd();
+});
+
+document.getElementById('debugBtn').onclick=()=>{
+  mask.style.display = mask.style.display==='none' ? 'block' : 'none';
+};
+
+document.getElementById('resetBtn').onclick=resetTracer;
+
+// Tracer state
+let lastGray = null;          // previous grayscale (Uint8Array)
+let lastPt = null;            // previous detected center (display coords)
+let path = [];                // array of {x,y}
+let tracing = false;
+let speedEMA = 0;
+let stillCount = 0;
+
+// Mapping from processing canvas to display canvas
+let sx=1, sy=1;
+
+// Camera setup
+navigator.mediaDevices.getUserMedia({ video:{ facingMode:'environment' }, audio:false })
+.then(stream=>{
+  video.srcObject = stream;
+  video.onloadedmetadata = ()=>{
+    video.play();
+
+    // Choose processing size ~480px wide, preserve aspect ratio of view
+    const targetW = 480;
+    const aspect = view.height / view.width; // 370 / 1180
+    proc.width  = targetW;
+    proc.height = Math.max(1, Math.round(targetW * aspect));
+
+    // Scale factors from processing → view
+    sx = view.width / proc.width;
+    sy = view.height / proc.height;
+
+    statusBox.textContent = '📷 Camera ready — roll the ball';
+    requestAnimationFrame(loop);
+  };
+}).catch(err=>{
+  statusBox.textContent = '❌ Camera error: ' + err;
+});
+
+// Convert rgba buffer to grayscale (luma)
+function toGray(rgba) {
+  const gray = new Uint8Array(rgba.length/4);
+  for (let i=0, j=0; i<rgba.length; i+=4, j++){
+    const r=rgba[i], g=rgba[i+1], b=rgba[i+2];
+    // Rec. 709 luma
+    gray[j] = (0.2126*r + 0.7152*g + 0.0722*b) | 0;
+  }
+  return gray;
 }
 
-function loop() {
-  // draw video frame
-  ctx.drawImage(video, 0,0, canvas.width, canvas.height);
-  
-  try { cap.read(frame); } catch(e) {
-    requestAnimationFrame(loop);
-    return;
-  }
+// Frame-diff + centroid (simple blob – center of mass of motion)
+function motionCenter(currGray, prevGray, w, h, thr, minAreaPx, maxAreaPx) {
+  if (!prevGray) return null;
 
-  // background subtractor to find motion
-  mog.apply(frame, fgmask);
-  cv.threshold(fgmask, fgmask, 200, 255, cv.THRESH_BINARY);
-  cv.morphologyEx(fgmask, fgmask, cv.MORPH_OPEN, cv.Mat.ones(5,5,cv.CV_8U));
-
-  // find moving blob = ball
-  let contours = new cv.MatVector();
-  let hierarchy = new cv.Mat();
-  cv.findContours(fgmask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-
-  let bestArea = 0, bx = null, by = null;
-
-  for (let i = 0; i < contours.size(); i++) {
-    let cnt  = contours.get(i);
-    let area = cv.contourArea(cnt);
-
-    if (area > 25 && area < 2000 && area > bestArea) {
-      let rect = cv.boundingRect(cnt);
-      bx = rect.x + rect.width / 2;
-      by = rect.y + rect.height / 2;
-      bestArea = area;
+  let sumX=0, sumY=0, count=0;
+  // stride across pixels (every pixel for accuracy; could sub-sample if needed)
+  for (let y=0, idx=0; y<h; y++){
+    for (let x=0; x<w; x++, idx++){
+      const d = Math.abs(currGray[idx] - prevGray[idx]);
+      if (d >= thr) {
+        sumX += x;
+        sumY += y;
+        count++;
+      }
     }
   }
 
-  if (bx && by) {
-    ballWasMoving = true;
-    lastBall = { x:bx, y:by };
+  if (count < minAreaPx || count > maxAreaPx) return null;
+  return { x: sumX / count, y: sumY / count, area: count };
+}
 
-    ctx.beginPath();
-    ctx.arc(bx, by, 6, 0, Math.PI*2);
-    ctx.fillStyle = "lime";
-    ctx.fill();
+function resetTracer(){
+  path.length = 0;
+  tracing = false;
+  speedEMA = 0;
+  stillCount = 0;
+  lastPt = null;
+  statusBox.textContent = '↺ Reset — roll again';
+}
 
-    document.getElementById("status").textContent = "🏃 Ball moving…";
-  }
-  else if (ballWasMoving) {
-    ballWasMoving = false;
+function loop(){
+  // Draw the live video into the display canvas (stretched to 1180x370)
+  vctx.drawImage(video, 0, 0, view.width, view.height);
 
-    if (lastBall.x) {
-      ctx.beginPath();
-      ctx.arc(lastBall.x, lastBall.y, 12, 0, Math.PI*2);
-      ctx.lineWidth = 4;
-      ctx.strokeStyle = "cyan";
-      ctx.stroke();
+  // Draw downscaled frame for processing
+  pctx.drawImage(video, 0, 0, proc.width, proc.height);
 
-      document.getElementById("status").textContent = "⛳ Ball stopped — position locked";
+  // Read pixels
+  const img = pctx.getImageData(0,0,proc.width,proc.height);
+  const currGray = toGray(img.data);
+
+  // Compute motion center
+  const center = motionCenter(
+    currGray, lastGray,
+    proc.width, proc.height,
+    +diff.value,
+    +minA.value,
+    +maxA.value
+  );
+
+  // Draw debug mask if visible
+  if (mask.style.display !== 'none') {
+    const mImg = mctx.createImageData(mask.width, mask.height);
+    // downscale curr-prev diff into the mask canvas for visualization
+    const mW = mask.width, mH = mask.height;
+    for (let my=0; my<mH; my++){
+      const py = Math.floor(my * proc.height / mH);
+      for (let mx=0; mx<mW; mx++){
+        const px = Math.floor(mx * proc.width / mW);
+        const idx = py * proc.width + px;
+        const d = (!lastGray) ? 0 : Math.abs(currGray[idx] - lastGray[idx]);
+        const v = d >= +diff.value ? 255 : 0;
+        const o = (my*mW + mx) * 4;
+        mImg.data[o+0]=v; mImg.data[o+1]=v; mImg.data[o+2]=v; mImg.data[o+3]=255;
+      }
     }
+    mctx.putImageData(mImg, 0, 0);
   }
+
+  // Update tracer logic
+  if (center) {
+    // Map processing coords → display coords
+    const dx = center.x * sx;
+    const dy = center.y * sy;
+
+    // Velocity estimate
+    if (lastPt) {
+      const dist = Math.hypot(dx-lastPt.x, dy-lastPt.y);
+      const dt = 1/30; // ~30fps assumption
+      const speed = dist / dt; // px/sec (relative)
+      speedEMA = speed*0.25 + speedEMA*0.75;
+
+      if (!tracing && dist > 0.8) {
+        tracing = true;
+        path.length = 0;
+        path.push({x:dx, y:dy});
+        stillCount = 0;
+        statusBox.textContent = '🚀 Tracking…';
+      }
+
+      if (tracing) {
+        if (dist > 0.4) path.push({x:dx, y:dy});
+
+        // stop detection
+        if (speedEMA < 12) {
+          stillCount++;
+          if (stillCount > 8) {
+            tracing = false;
+            // Mark stop
+            const end = path[path.length-1] || {x:dx, y:dy};
+            vctx.strokeStyle = '#00ffff';
+            vctx.lineWidth = 4;
+            vctx.beginPath();
+            vctx.arc(end.x, end.y, 12, 0, Math.PI*2);
+            vctx.stroke();
+            statusBox.textContent = '⛳ Stopped';
+          }
+        } else {
+          stillCount = 0;
+        }
+      }
+    }
+
+    // Draw live motion dot
+    vctx.fillStyle = '#00ff6a';
+    vctx.beginPath();
+    vctx.arc(dx, dy, 5, 0, Math.PI*2);
+    vctx.fill();
+
+    lastPt = { x:dx, y:dy };
+
+  } else {
+    // no motion blob this frame; if tracing, still draw history
+  }
+
+  // Draw path
+  if (path.length > 1) {
+    vctx.strokeStyle = '#00ff80';
+    vctx.lineWidth = 4;
+    vctx.beginPath();
+    vctx.moveTo(path[0].x, path[0].y);
+    for (let i=1;i<path.length;i++) vctx.lineTo(path[i].x, path[i].y);
+    vctx.stroke();
+  }
+
+  // Keep gray buffer
+  lastGray = currGray;
 
   requestAnimationFrame(loop);
 }
-
-// ✅ When OpenCV is ready, start
-cv.onRuntimeInitialized = () => {
-  document.getElementById("status").textContent = "✅ OpenCV ready — activating camera";
-  startCamera();
-};
 </script>
 </body>
 </html>
