@@ -2,28 +2,34 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>HoverGreens Vision Boot Test</title>
+<title>HoverGreens Ball Vision — ASM Mode</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 
 <style>
   body { margin:0; background:#000; color:#fff; font-family:Arial; text-align:center; }
-  #status { font-size:18px; padding:8px; }
-  video, canvas { width:1180px; height:370px; background:#111; display:block; margin:10px auto; }
+  #status { font-size:18px; padding:10px; }
+  video, canvas { 
+    width:1180px; 
+    height:370px; 
+    background:#111; 
+    display:block; 
+    margin:10px auto;
+  }
 </style>
 
-<!-- ✅ Reliable OpenCV CDN (no local wasm needed) -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/opencv/4.5.2/opencv.js"></script>
+<!-- ✅ Local OpenCV ASM build (no wasm needed) -->
+<script src="opencv.js"></script>
+
 <script>
 let cvReady = false;
 
 cv['onRuntimeInitialized'] = () => {
   cvReady = true;
-  const statusBox = document.getElementById("status");
-  statusBox.textContent = "✅ OpenCV Ready — drawing enabled";
+  document.getElementById("status").innerText =
+    "✅ OpenCV Ready — ASM Mode Loaded";
   if (typeof loop === "function") requestAnimationFrame(loop);
 };
 </script>
-
 </head>
 <body>
 
@@ -34,13 +40,13 @@ cv['onRuntimeInitialized'] = () => {
 <canvas id="view" width="1180" height="370"></canvas>
 
 <script>
-const statusBox = document.getElementById("status");
 const video = document.getElementById("cam");
 const canvas = document.getElementById("view");
 const ctx = canvas.getContext("2d");
+const statusBox = document.getElementById("status");
 
-// ✅ Start camera
-navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }})
+// ✅ Start camera (overhead USB or internal)
+navigator.mediaDevices.getUserMedia({ video:true })
 .then(stream => {
   video.srcObject = stream;
   video.onloadedmetadata = () => video.play();
@@ -50,18 +56,18 @@ navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }})
   statusBox.textContent = "❌ Camera blocked — enable permissions";
 });
 
-// ✅ Draw loop (runs once OpenCV loads)
+// ✅ Draw loop (runs once OpenCV ready)
 function loop() {
-  // draw mirrored camera feed
+  // mirrored feed (like putting mirror)
   ctx.save();
   ctx.scale(-1,1);
   ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
   ctx.restore();
 
-  // ✅ debug dot — proves rendering works
+  // ✅ Debug dot (proves render loop works)
   ctx.fillStyle = "white";
   ctx.beginPath();
-  ctx.arc(50, 50, 12, 0, Math.PI*2);
+  ctx.arc(50, 50, 10, 0, Math.PI*2);
   ctx.fill();
 
   requestAnimationFrame(loop);
