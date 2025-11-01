@@ -6,45 +6,44 @@
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 
 <style>
-  body { margin:0; background:#000; color:#fff; font-family:Arial, Helvetica, sans-serif; text-align:center; }
-  h2 { margin:10px 0 6px; font-size:18px; }
-  #status { font-size:14px; color:#7dff7d; min-height:20px; margin-bottom:6px; }
+  body { margin:0; background:#000; color:#fff; font-family:Arial; text-align:center; }
+  h2 { margin:10px 0 6px; font-size:20px; }
+  #status { font-size:14px; color:#7dff7d; min-height:20px; margin-bottom:8px; }
   .row { display:flex; justify-content:center; gap:10px; flex-wrap:wrap; margin-bottom:6px; }
   button { background:#111; color:#fff; border:1px solid #444; border-radius:8px; padding:8px 14px; cursor:pointer; }
-  button.primary { border-color:#4cff70; }
+  button:hover { border-color:#4cff70; }
   label { font-size:12px; color:#bbb; }
-  video { display:none; } /* we render to canvas */
+  video { display:none; }
   canvas { width:1180px; height:370px; background:#111; display:block; margin:8px auto; }
   .thumb { position:absolute; right:14px; top:14px; border:1px solid #333; width:220px; height:124px; background:#000; }
   .stage { position:relative; }
 </style>
 
-<!-- ✅ Local OpenCV ASM-only (no wasm file needed) -->
+<!-- ✅ Local OpenCV ASM build (no wasm needed) -->
 <script src="opencv.js"></script>
 <script>
 let cvReady = false;
 cv['onRuntimeInitialized'] = () => {
   cvReady = true;
-  const s = document.getElementById('status');
-  s.textContent = '✅ OpenCV Ready — ASM Mode Loaded';
-  if (typeof loop === 'function') requestAnimationFrame(loop);
+  document.getElementById("status").innerText = "✅ OpenCV Ready — ASM Mode Loaded";
+  if (typeof loop === "function") requestAnimationFrame(loop);
 };
 </script>
 </head>
 <body>
 
-<h2>HoverGreens — Ball Tracer (White Ball • Home Lighting)</h2>
+<h2>HoverGreens — Ball Tracer (White Ball)</h2>
 
 <div class="row">
   <button id="resetBtn">Reset</button>
-  <button id="debugBtn">Toggle Debug</button>
-  <label> Vmin <span id="vVal">185</span>
+  <button id="debugBtn">Debug</button>
+  <label>Vmin <span id="vVal">185</span>
     <input id="vmin" type="range" min="140" max="255" step="1" value="185" />
   </label>
-  <label> Smax <span id="sVal">70</span>
+  <label>Smax <span id="sVal">70</span>
     <input id="smax" type="range" min="20" max="150" step="1" value="70" />
   </label>
-  <label> MinArea <span id="aVal">120</span>
+  <label>MinArea <span id="aVal">120</span>
     <input id="amin" type="range" min="30" max="2000" step="10" value="120" />
   </label>
 </div>
@@ -59,103 +58,87 @@ cv['onRuntimeInitialized'] = () => {
 </div>
 
 <script>
-/* DOM refs */
 const statusBox = document.getElementById('status');
 const video     = document.getElementById('cam');
 const canvas    = document.getElementById('view');
 const ctx       = canvas.getContext('2d');
 const maskThumb = document.getElementById('maskThumb').getContext('2d');
 
-/* Tuning controls (white ball on green, home lighting defaults) */
 const vmin = document.getElementById('vmin');
 const smax = document.getElementById('smax');
 const amin = document.getElementById('amin');
 const vVal = document.getElementById('vVal');
 const sVal = document.getElementById('sVal');
 const aVal = document.getElementById('aVal');
+
 [vmin,smax,amin].forEach(inp=>{
   const map = {vmin:vVal,smax:sVal,amin:aVal}[inp.id];
   const upd = ()=> map.textContent = inp.value;
   inp.oninput = upd; upd();
 });
 
-/* UI buttons */
 const resetBtn = document.getElementById('resetBtn');
 const debugBtn = document.getElementById('debugBtn');
 
-/* State */
 let debugMode  = false;
 let path = [];
 let tracing = false;
-let last = null;              // {x,y,t}
+let last = null;
 let speedEMA = 0;
 let stillCount = 0;
 
-/* Start camera */
-navigator.mediaDevices.getUserMedia({ video:true })
-.then(stream=>{
+/* Camera feed */
+navigator.mediaDevices.getUserMedia({ video:true }).then(stream=>{
   video.srcObject = stream;
   video.onloadedmetadata = ()=>video.play();
   statusBox.textContent = '📷 Camera started — waiting for OpenCV…';
-})
-.catch(()=>{
-  statusBox.textContent = '❌ Camera blocked — allow permissions in browser';
+}).catch(()=>{
+  statusBox.textContent = '❌ Camera blocked — enable permissions';
 });
 
-/* Toggle debug */
 debugBtn.onclick = ()=>{
   debugMode = !debugMode;
-  statusBox.textContent = debugMode ? '🐛 Debug ON (showing mask preview)' : '✅ Debug OFF';
+  statusBox.textContent = debugMode ? '🐛 Debug ON' : '✅ Debug OFF';
 };
 
-/* Reset */
 resetBtn.onclick = ()=>{
   path = [];
   tracing = false;
   last = null;
   speedEMA = 0;
   stillCount = 0;
-  statusBox.textContent = '↺ Reset — ready for next putt';
+  statusBox.textContent = '↺ Ready for next putt';
 };
 
-/* --- BALL DETECTION --- */
 function detectBall() {
-  // read current video frame into OpenCV Mat
-  const W = canvas.width, H = canvas.height;
-  let src = new cv.Mat(H, W, cv.CV_8UC4);
-  let cap = new cv.VideoCapture(video);
-  cap.read(src);
+  let src = cv.imread(canvas);
 
-  // Convert to HSV
   let hsv = new cv.Mat();
   cv.cvtColor(src, hsv, cv.COLOR_RGBA2HSV);
 
-  // Split channels: H,S,V
   let mv = new cv.MatVector();
   cv.split(hsv, mv);
-  let Hc = mv.get(0), Sc = mv.get(1), Vc = mv.get(2);
+  let Sc = mv.get(1), Vc = mv.get(2);
 
-  // White-ish: S <= Smax ; Bright: V >= Vmin
-  let sMask = new cv.Mat();  cv.threshold(Sc, sMask, +smax.value, 255, cv.THRESH_BINARY_INV);
-  let vMask = new cv.Mat();  cv.threshold(Vc, vMask, +vmin.value, 255, cv.THRESH_BINARY);
+  let sMask = new cv.Mat();
+  cv.threshold(Sc, sMask, +smax.value, 255, cv.THRESH_BINARY_INV);
+
+  let vMask = new cv.Mat();
+  cv.threshold(Vc, vMask, +vmin.value, 255, cv.THRESH_BINARY);
 
   let mask = new cv.Mat();
   cv.bitwise_and(sMask, vMask, mask);
 
-  // Morph close to fill specular shadow gaps
-  const K = 3; // fixed small kernel for ASM perf
+  const K = 3;
   let kernel = cv.Mat.ones(K, K, cv.CV_8U);
   cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel);
   kernel.delete();
 
-  // Smooth a little
   cv.GaussianBlur(mask, mask, new cv.Size(5,5), 0);
 
-  // Contours
   let cnts = new cv.MatVector(), hier = new cv.Mat();
   cv.findContours(mask, cnts, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-  // Pick by circularity (good for balls), fallback to area
   let bestIndex = -1, bestScore = -1, bestArea = 0;
   for (let i=0;i<cnts.size();i++){
     const c = cnts.get(i);
@@ -164,9 +147,8 @@ function detectBall() {
 
     const peri = cv.arcLength(c, true);
     if (peri <= 0) continue;
-    const circ = (4*Math.PI*area)/(peri*peri); // 1.0 is a perfect circle
+    const circ = (4*Math.PI*area)/(peri*peri);
 
-    // prefer circularity, break ties with area
     const score = circ*1000 + area/1000;
     if (score > bestScore) { bestScore = score; bestIndex = i; bestArea = area; }
   }
@@ -177,7 +159,6 @@ function detectBall() {
     if (m.m00 !== 0) center = { x: m.m10/m.m00, y: m.m01/m.m00, area: bestArea };
   }
 
-  // Debug mask preview
   if (debugMode) {
     let small = new cv.Mat();
     cv.resize(mask, small, new cv.Size(220,124));
@@ -187,20 +168,16 @@ function detectBall() {
     maskThumb.putImageData(img, 0, 0);
     small.delete(); rgba.delete();
   } else {
-    // clear thumbnail when debug off
     maskThumb.clearRect(0,0,220,124);
   }
 
-  // Cleanup
-  src.delete(); hsv.delete(); mv.delete(); Hc.delete(); Sc.delete(); Vc.delete();
+  src.delete(); hsv.delete(); mv.delete(); Sc.delete(); Vc.delete();
   sMask.delete(); vMask.delete(); mask.delete(); cnts.delete(); hier.delete();
 
-  return center; // {x,y,area} or null
+  return center;
 }
 
-/* --- MAIN LOOP --- */
 function loop(){
-  // Draw mirrored camera to canvas
   ctx.save();
   ctx.scale(-1,1);
   ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
@@ -208,76 +185,60 @@ function loop(){
 
   if (cvReady) {
     const pt = detectBall();
-
     if (pt) {
-      // Draw ball highlight
       ctx.strokeStyle = '#00eaff';
       ctx.lineWidth = 4;
       ctx.beginPath();
       ctx.arc(pt.x, pt.y, 12, 0, Math.PI*2);
       ctx.stroke();
 
-      // Track movement
       const now = performance.now();
       if (last) {
-        const dt = Math.max(1, (now - last.t)) / 1000.0; // seconds
-        const dist = Math.hypot(pt.x - last.x, pt.y - last.y); // pixels/frame
-        const speed = dist / dt; // px/sec
-        // smooth speed
+        const dt = Math.max(1, (now-last.t))/1000;
+        const dist = Math.hypot(pt.x-last.x, pt.y-last.y);
+        const speed = dist/dt;
         speedEMA = speed*0.25 + speedEMA*0.75;
 
-        // Start tracing when movement kicks up
-        if (!tracing && dist > 1.8) {
+        if (!tracing && dist>1.8) {
           tracing = true;
-          path = [ {...last}, {x:pt.x, y:pt.y} ];
+          path = [ {...last}, {x:pt.x,y:pt.y} ];
           stillCount = 0;
-          statusBox.textContent = '🚀 Ball moving — tracing path';
+          statusBox.textContent = '🚀 Ball moving — tracing';
         }
 
-        // Continue tracing
         if (tracing) {
-          if (dist > 0.6) path.push({x:pt.x, y:pt.y});
-          // consider stopped when smoothed speed falls low for a bit
+          if (dist>0.6) path.push({x:pt.x,y:pt.y});
           if (speedEMA < 5) {
             stillCount++;
-            if (stillCount > 12) {
+            if (stillCount>12) {
               tracing = false;
-              // mark end point
               const end = path[path.length-1];
               ctx.strokeStyle = '#ff5050';
               ctx.lineWidth = 3;
               ctx.beginPath();
-              ctx.arc(end.x, end.y, 14, 0, Math.PI*2);
+              ctx.arc(end.x,end.y,14,0,Math.PI*2);
               ctx.stroke();
-
-              // (Optional) estimate roll distance in inches if you know px->inch scale
-              statusBox.textContent = '⛳ Ball stopped — press Reset for next putt';
+              statusBox.textContent = '⛳ Ball stopped — Reset for next putt';
             }
-          } else {
-            stillCount = 0;
-          }
+          } else stillCount=0;
         }
       }
-      last = { x: pt.x, y: pt.y, t: now };
-    } else {
-      // no detection this frame; if tracing, keep waiting (do not clear)
+      last = {x:pt.x,y:pt.y,t:now};
     }
 
-    // Draw traced path
-    if (path.length > 1) {
+    if (path.length>1) {
       ctx.strokeStyle = '#00ff80';
       ctx.lineWidth = 4;
       ctx.beginPath();
-      ctx.moveTo(path[0].x, path[0].y);
-      for (let i=1;i<path.length;i++) ctx.lineTo(path[i].x, path[i].y);
+      ctx.moveTo(path[0].x,path[0].y);
+      for (let i=1;i<path.length;i++) ctx.lineTo(path[i].x,path[i].y);
       ctx.stroke();
     }
   }
 
-  // (Keep tiny debug dot so you know loop is alive)
   ctx.fillStyle = 'white';
   ctx.beginPath();
-  ctx.arc(50, 50, 8, 0, Math.PI*2);
+  ctx.arc(50,50,8,0,Math.PI*2);
   ctx.fill();
 
   requestAnimationFrame(loop);
