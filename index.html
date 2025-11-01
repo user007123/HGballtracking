@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>HoverGreens Ball Tracer — ASM OpenCV</title>
+<title>HoverGreens Ball Tracer — ROI + ASM OpenCV</title>
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 
 <style>
@@ -15,8 +15,9 @@
   label { font-size:12px; color:#bbb; }
   video { display:none; }
   canvas { width:1180px; height:370px; background:#111; display:block; margin:8px auto; }
-  .thumb { position:absolute; right:14px; top:14px; border:1px solid #333; width:220px; height:124px; background:#000; }
+  .thumb { position:absolute; right:14px; top:14px; border:1px solid #333; width:220px; height:124px; background:#000; display:none; }
   .stage { position:relative; }
+  .hint { color:#bbb; font-size:12px; margin-top:-2px; }
 </style>
 
 <!-- ✅ Local OpenCV ASM build (no wasm needed) -->
@@ -25,28 +26,30 @@
 let cvReady = false;
 cv['onRuntimeInitialized'] = () => {
   cvReady = true;
-  document.getElementById("status").innerText = "✅ OpenCV Ready — ASM Mode Loaded";
+  document.getElementById("status").innerText = "✅ OpenCV Ready — ASM Mode";
   if (typeof loop === "function") requestAnimationFrame(loop);
 };
 </script>
 </head>
 <body>
 
-<h2>HoverGreens — Ball Tracer (White Ball)</h2>
+<h2>HoverGreens — Ball Tracer (ROI Start Box)</h2>
 
 <div class="row">
   <button id="resetBtn">Reset</button>
   <button id="debugBtn">Debug</button>
+  <button id="setBoxBtn">Set Start Box</button>
   <label>Vmin <span id="vVal">185</span>
     <input id="vmin" type="range" min="140" max="255" step="1" value="185" />
   </label>
-  <label>Smax <span id="sVal">70</span>
-    <input id="smax" type="range" min="20" max="150" step="1" value="70" />
+  <label>Smax <span id="sVal">80</span>
+    <input id="smax" type="range" min="20" max="150" step="1" value="80" />
   </label>
   <label>MinArea <span id="aVal">120</span>
     <input id="amin" type="range" min="30" max="2000" step="10" value="120" />
   </label>
 </div>
+<div class="hint">Place ball inside the green start box. Tracing begins when the ball moves out of the box.</div>
 
 <div id="status">⏳ Initializing camera & OpenCV…</div>
 
@@ -60,8 +63,10 @@ cv['onRuntimeInitialized'] = () => {
 <script>
 const statusBox = document.getElementById('status');
 const video     = document.getElementById('cam');
+// ⚡ faster readback for getImageData (fixes warning)
+const ctxOpts   = { willReadFrequently: true };
 const canvas    = document.getElementById('view');
-const ctx       = canvas.getContext('2d');
+const ctx       = canvas.getContext('2d', ctxOpts);
 const maskThumb = document.getElementById('maskThumb').getContext('2d');
 
 const vmin = document.getElementById('vmin');
@@ -70,24 +75,32 @@ const amin = document.getElementById('amin');
 const vVal = document.getElementById('vVal');
 const sVal = document.getElementById('sVal');
 const aVal = document.getElementById('aVal');
-
 [vmin,smax,amin].forEach(inp=>{
   const map = {vmin:vVal,smax:sVal,amin:aVal}[inp.id];
   const upd = ()=> map.textContent = inp.value;
   inp.oninput = upd; upd();
 });
 
-const resetBtn = document.getElementById('resetBtn');
-const debugBtn = document.getElementById('debugBtn');
+const resetBtn  = document.getElementById('resetBtn');
+const debugBtn  = document.getElementById('debugBtn');
+const setBoxBtn = document.getElementById('setBoxBtn');
 
-let debugMode  = false;
+/* ===== State ===== */
+let debugMode   = false;
+let showThumb   = false;
 let path = [];
 let tracing = false;
 let last = null;
 let speedEMA = 0;
 let stillCount = 0;
+let frameCount = 0;
+let setBoxMode = false;
 
-/* Camera feed */
+// ROI (start box) defaults — adjust to your preferred corner
+// Canvas is 1180x370 (length x width). Place near left edge (x ~ 110), mid-height (y ~ 185).
+let box = { x:110, y:185, w:140, h:140, color:"#00aa55" };
+
+/* ===== Camera ===== */
 navigator.mediaDevices.getUserMedia({ video:true }).then(stream=>{
   video.srcObject = stream;
   video.onloadedmetadata = ()=>video.play();
@@ -96,8 +109,11 @@ navigator.mediaDevices.getUserMedia({ video:true }).then(stream=>{
   statusBox.textContent = '❌ Camera blocked — enable permissions';
 });
 
+/* ===== UI ===== */
 debugBtn.onclick = ()=>{
   debugMode = !debugMode;
+  showThumb = debugMode;
+  document.querySelector('.thumb').style.display = showThumb ? 'block' : 'none';
   statusBox.textContent = debugMode ? '🐛 Debug ON' : '✅ Debug OFF';
 };
 
@@ -107,33 +123,133 @@ resetBtn.onclick = ()=>{
   last = null;
   speedEMA = 0;
   stillCount = 0;
-  statusBox.textContent = '↺ Ready for next putt';
+  statusBox.textContent = '↺ Ready — place ball inside the start box';
 };
 
-function detectBall() {
+setBoxBtn.onclick = ()=>{
+  setBoxMode = true;
+  statusBox.textContent = '🟩 Click the canvas where you want the start box CENTER';
+};
+canvas.addEventListener('click', (e)=>{
+  if (!setBoxMode) return;
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const cx = (e.clientX - rect.left) * scaleX;
+  const cy = (e.clientY - rect.top)  * scaleY;
+  box.x = Math.round(cx);
+  box.y = Math.round(cy);
+  setBoxMode = false;
+  statusBox.textContent = '✅ Start box set — place ball inside the green square';
+});
+
+/* ===== Helpers ===== */
+function drawStartBox() {
+  ctx.save();
+  ctx.strokeStyle = box.color;
+  ctx.lineWidth = 3;
+  ctx.strokeRect(box.x - box.w/2, box.y - box.h/2, box.w, box.h);
+  ctx.fillStyle = 'rgba(0,170,85,0.10)';
+  ctx.fillRect(box.x - box.w/2, box.y - box.h/2, box.w, box.h);
+  ctx.restore();
+}
+
+function detectBallROI() {
+  // Read full frame (already drawn to canvas)
   let src = cv.imread(canvas);
 
-  let hsv = new cv.Mat();
-  cv.cvtColor(src, hsv, cv.COLOR_RGBA2HSV);
+  // Extract ROI (start box) to reduce CPU & false hits
+  const rx = Math.max(0, box.x - Math.floor(box.w/2));
+  const ry = Math.max(0, box.y - Math.floor(box.h/2));
+  const rw = Math.min(canvas.width - rx, box.w);
+  const rh = Math.min(canvas.height - ry, box.h);
+  let roiRect = new cv.Rect(rx, ry, rw, rh);
+  let roi = new cv.Mat();
+  try { roi = src.roi(roiRect); } catch(e){ src.delete(); return { pt:null, leftROI:true }; }
 
+  // HSV & threshold (white ball: low S, high V)
+  let hsv = new cv.Mat();
+  cv.cvtColor(roi, hsv, cv.COLOR_RGBA2HSV);
   let mv = new cv.MatVector();
   cv.split(hsv, mv);
   let Sc = mv.get(1), Vc = mv.get(2);
 
   let sMask = new cv.Mat();
   cv.threshold(Sc, sMask, +smax.value, 255, cv.THRESH_BINARY_INV);
-
   let vMask = new cv.Mat();
   cv.threshold(Vc, vMask, +vmin.value, 255, cv.THRESH_BINARY);
-
   let mask = new cv.Mat();
   cv.bitwise_and(sMask, vMask, mask);
 
-  const K = 3;
-  let kernel = cv.Mat.ones(K, K, cv.CV_8U);
+  // Clean up shadow gaps
+  let kernel = cv.Mat.ones(3,3,cv.CV_8U);
   cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel);
   kernel.delete();
+  cv.GaussianBlur(mask, mask, new cv.Size(5,5), 0);
 
+  // Contours in ROI
+  let cnts = new cv.MatVector(), hier = new cv.Mat();
+  cv.findContours(mask, cnts, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+  // Best circular blob
+  let bestIndex = -1, bestScore = -1;
+  for (let i=0;i<cnts.size();i++){
+    const c = cnts.get(i);
+    const area = cv.contourArea(c);
+    if (area < +amin.value) continue;
+    const peri = cv.arcLength(c,true); if (peri <= 0) continue;
+    const circ = (4*Math.PI*area)/(peri*peri);
+    const score = circ*1000 + area/1000;
+    if (score > bestScore) { bestScore = score; bestIndex = i; }
+  }
+
+  let center = null;
+  if (bestIndex >= 0) {
+    const m = cv.moments(cnts.get(bestIndex));
+    if (m.m00 !== 0) {
+      // Map ROI coords → canvas coords
+      const cx = rx + (m.m10/m.m00);
+      const cy = ry + (m.m01/m.m00);
+      center = { x: cx, y: cy };
+    }
+  }
+
+  // Debug mini-mask (optional)
+  if (showThumb) {
+    let small = new cv.Mat();
+    cv.resize(mask, small, new cv.Size(220,124));
+    let rgba = new cv.Mat();
+    cv.cvtColor(small, rgba, cv.COLOR_GRAY2RGBA);
+    const img = new ImageData(new Uint8ClampedArray(rgba.data), rgba.cols, rgba.rows);
+    maskThumb.putImageData(img, 0, 0);
+    small.delete(); rgba.delete();
+  } else {
+    maskThumb.clearRect(0,0,220,124);
+  }
+
+  // Cleanup
+  src.delete(); roi.delete(); hsv.delete(); mv.delete(); Sc.delete(); Vc.delete();
+  sMask.delete(); vMask.delete(); mask.delete(); cnts.delete(); hier.delete();
+
+  return { pt:center, leftROI:false };
+}
+
+function detectBallFull() {
+  // After leaving ROI, track anywhere on canvas (throttled)
+  let src = cv.imread(canvas);
+  let hsv = new cv.Mat();
+  cv.cvtColor(src, hsv, cv.COLOR_RGBA2HSV);
+  let mv = new cv.MatVector();
+  cv.split(hsv, mv);
+  let Sc = mv.get(1), Vc = mv.get(2);
+
+  let sMask = new cv.Mat();  cv.threshold(Sc, sMask, +smax.value, 255, cv.THRESH_BINARY_INV);
+  let vMask = new cv.Mat();  cv.threshold(Vc, vMask, +vmin.value, 255, cv.THRESH_BINARY);
+  let mask = new cv.Mat();   cv.bitwise_and(sMask, vMask, mask);
+
+  let kernel = cv.Mat.ones(3,3,cv.CV_8U);
+  cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel);
+  kernel.delete();
   cv.GaussianBlur(mask, mask, new cv.Size(5,5), 0);
 
   let cnts = new cv.MatVector(), hier = new cv.Mat();
@@ -144,8 +260,7 @@ function detectBall() {
     const c = cnts.get(i);
     const area = cv.contourArea(c);
     if (area < +amin.value) continue;
-    const peri = cv.arcLength(c,true);
-    if (peri <= 0) continue;
+    const peri = cv.arcLength(c,true); if (peri<=0) continue;
     const circ = (4*Math.PI*area)/(peri*peri);
     const score = circ*1000 + area/1000;
     if (score > bestScore) { bestScore = score; bestIndex = i; }
@@ -157,7 +272,7 @@ function detectBall() {
     if (m.m00 !== 0) center = { x: m.m10/m.m00, y: m.m01/m.m00 };
   }
 
-  if (debugMode) {
+  if (showThumb) {
     let small = new cv.Mat();
     cv.resize(mask, small, new cv.Size(220,124));
     let rgba = new cv.Mat();
@@ -175,23 +290,52 @@ function detectBall() {
   return center;
 }
 
-/* ✅ SAFE LOOP — prevents “undefined mat” error */
+/* ===== Main Loop (safe + throttled) ===== */
 function loop() {
+  // Draw mirrored camera
   ctx.save();
   ctx.scale(-1,1);
   ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
   ctx.restore();
 
+  // Draw start box until tracing begins
+  if (!tracing) drawStartBox();
+
   if (cvReady && video.readyState >= 2) {
+    frameCount++;
+
     let pt = null;
+
     try {
-      pt = detectBall();
+      if (!tracing) {
+        // Detect only INSIDE the start box (stable + fast)
+        const res = detectBallROI();
+        pt = res.pt;
+
+        // If a ball is found and it moves OUTSIDE the box → start tracing
+        if (pt) {
+          const inBox = (pt.x > box.x - box.w/2 && pt.x < box.x + box.w/2 &&
+                         pt.y > box.y - box.h/2 && pt.y < box.y + box.h/2);
+          if (!inBox) {
+            tracing = true;
+            path = [{x:pt.x, y:pt.y}];
+            stillCount = 0;
+            speedEMA = 0;
+            statusBox.textContent = '🚀 Ball left start box — tracing';
+          }
+        }
+      } else {
+        // After leaving ROI, track full frame (every other frame for ASM perf)
+        if (frameCount % 2 === 0) pt = detectBallFull();
+      }
     } catch(e) {
       console.warn("Frame skipped:", e);
       pt = null;
     }
 
+    // Draw ball marker + build path + stop detection
     if (pt) {
+      // cyan ring
       ctx.strokeStyle = '#00eaff';
       ctx.lineWidth = 4;
       ctx.beginPath();
@@ -200,21 +344,13 @@ function loop() {
 
       const now = performance.now();
       if (last) {
-        const dt = Math.max(1, now-last.t)/1000;
+        const dt = Math.max(1, now - last.t)/1000;
         const dist = Math.hypot(pt.x-last.x, pt.y-last.y);
         const speed = dist/dt;
         speedEMA = speed*0.25 + speedEMA*0.75;
 
-        if (!tracing && dist>1.8) {
-          tracing = true;
-          path = [ {...last}, {x:pt.x, y:pt.y} ];
-          stillCount = 0;
-          statusBox.textContent = '🚀 Ball moving — tracing';
-        }
-
         if (tracing) {
-          if (dist>0.6) path.push({x:pt.x, y:pt.y});
-
+          if (dist > 0.6) path.push({x:pt.x, y:pt.y});
           if (speedEMA < 5) {
             stillCount++;
             if (stillCount > 12) {
@@ -227,22 +363,26 @@ function loop() {
               ctx.stroke();
               statusBox.textContent = '⛳ Ball stopped — Reset for next putt';
             }
-          } else stillCount = 0;
+          } else {
+            stillCount = 0;
+          }
         }
       }
-      last = {x:pt.x, y:pt.y, t:now};
+      last = { x:pt.x, y:pt.y, t:performance.now() };
     }
 
-    if (path.length>1) {
+    // Draw path
+    if (path.length > 1) {
       ctx.strokeStyle = '#00ff80';
       ctx.lineWidth = 4;
       ctx.beginPath();
-      ctx.moveTo(path[0].x,path[0].y);
-      for (let i=1;i<path.length;i++) ctx.lineTo(path[i].x,path[i].y);
+      ctx.moveTo(path[0].x, path[0].y);
+      for (let i=1;i<path.length;i++) ctx.lineTo(path[i].x, path[i].y);
       ctx.stroke();
     }
   }
 
+  // Heartbeat
   ctx.fillStyle = 'white';
   ctx.beginPath();
   ctx.arc(50,50,8,0,Math.PI*2);
