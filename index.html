@@ -139,24 +139,22 @@ function detectBall() {
   let cnts = new cv.MatVector(), hier = new cv.Mat();
   cv.findContours(mask, cnts, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-  let bestIndex = -1, bestScore = -1, bestArea = 0;
+  let bestIndex = -1, bestScore = -1;
   for (let i=0;i<cnts.size();i++){
     const c = cnts.get(i);
     const area = cv.contourArea(c);
     if (area < +amin.value) continue;
-
-    const peri = cv.arcLength(c, true);
+    const peri = cv.arcLength(c,true);
     if (peri <= 0) continue;
     const circ = (4*Math.PI*area)/(peri*peri);
-
     const score = circ*1000 + area/1000;
-    if (score > bestScore) { bestScore = score; bestIndex = i; bestArea = area; }
+    if (score > bestScore) { bestScore = score; bestIndex = i; }
   }
 
   let center = null;
   if (bestIndex >= 0) {
     const m = cv.moments(cnts.get(bestIndex));
-    if (m.m00 !== 0) center = { x: m.m10/m.m00, y: m.m01/m.m00, area: bestArea };
+    if (m.m00 !== 0) center = { x: m.m10/m.m00, y: m.m01/m.m00 };
   }
 
   if (debugMode) {
@@ -177,14 +175,22 @@ function detectBall() {
   return center;
 }
 
-function loop(){
+/* ✅ SAFE LOOP — prevents “undefined mat” error */
+function loop() {
   ctx.save();
   ctx.scale(-1,1);
   ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
   ctx.restore();
 
-  if (cvReady) {
-    const pt = detectBall();
+  if (cvReady && video.readyState >= 2) {
+    let pt = null;
+    try {
+      pt = detectBall();
+    } catch(e) {
+      console.warn("Frame skipped:", e);
+      pt = null;
+    }
+
     if (pt) {
       ctx.strokeStyle = '#00eaff';
       ctx.lineWidth = 4;
@@ -194,23 +200,24 @@ function loop(){
 
       const now = performance.now();
       if (last) {
-        const dt = Math.max(1, (now-last.t))/1000;
+        const dt = Math.max(1, now-last.t)/1000;
         const dist = Math.hypot(pt.x-last.x, pt.y-last.y);
         const speed = dist/dt;
         speedEMA = speed*0.25 + speedEMA*0.75;
 
         if (!tracing && dist>1.8) {
           tracing = true;
-          path = [ {...last}, {x:pt.x,y:pt.y} ];
+          path = [ {...last}, {x:pt.x, y:pt.y} ];
           stillCount = 0;
           statusBox.textContent = '🚀 Ball moving — tracing';
         }
 
         if (tracing) {
-          if (dist>0.6) path.push({x:pt.x,y:pt.y});
+          if (dist>0.6) path.push({x:pt.x, y:pt.y});
+
           if (speedEMA < 5) {
             stillCount++;
-            if (stillCount>12) {
+            if (stillCount > 12) {
               tracing = false;
               const end = path[path.length-1];
               ctx.strokeStyle = '#ff5050';
@@ -220,10 +227,10 @@ function loop(){
               ctx.stroke();
               statusBox.textContent = '⛳ Ball stopped — Reset for next putt';
             }
-          } else stillCount=0;
+          } else stillCount = 0;
         }
       }
-      last = {x:pt.x,y:pt.y,t:now};
+      last = {x:pt.x, y:pt.y, t:now};
     }
 
     if (path.length>1) {
