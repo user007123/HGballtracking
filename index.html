@@ -2,86 +2,179 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>HoverGreens Vision Debug — Pixel Finder</title>
+<title>HoverGreens Vision — Ball Lock Engine</title>
 <style>
-  body{margin:0;background:#000;color:#0f0;font-family:Arial;text-align:center;}
-  canvas{background:#000;margin:8px auto;display:block;border:1px solid #333;}
-  #info{margin-top:5px;font-size:14px;}
+  body{margin:0;background:#000;color:#fff;font-family:Arial;text-align:center;}
+  canvas{display:block;margin:6px auto;background:#000;}
+  video{display:none}
+  #status{margin:8px;font-size:14px;color:#00ff9c;}
 </style>
 </head>
 <body>
 
-<h3>HoverGreens Vision — Ball Pixel Debug Mode</h3>
-<div id="info">Move mouse over ball — checking pixel values…</div>
+<h3>HoverGreens Vision — Ball Tracking</h3>
+<div id="status">Initializing camera…</div>
 
-<video id="vid" autoplay playsinline muted style="display:none"></video>
-<canvas id="view" width="960" height="540"></canvas>
-<canvas id="zoom" width="120" height="120"></canvas>
-<canvas id="mask" width="960" height="540"></canvas>
+<video id="cam" autoplay playsinline muted></video>
+<canvas id="proc" width="960" height="540"></canvas>
+<canvas id="view" width="1180" height="370"></canvas>
 
 <script>
-const vid=document.getElementById("vid");
+const statusEl=document.getElementById("status");
+const vid=document.getElementById("cam");
+const proc=document.getElementById("proc");
+const pctx=proc.getContext("2d",{willReadFrequently:true});
 const view=document.getElementById("view");
 const vctx=view.getContext("2d",{willReadFrequently:true});
-const zoom=document.getElementById("zoom");
-const zctx=zoom.getContext("2d",{willReadFrequently:true});
-const mask=document.getElementById("mask");
-const mctx=mask.getContext("2d",{willReadFrequently:true});
-const info=document.getElementById("info");
 
-// ✅ camera request with fallback
-navigator.mediaDevices.getUserMedia({
-  video:{width:{ideal:1920},height:{ideal:1080},facingMode:"environment"},
-  audio:false
-}).then(s=>{
-  vid.srcObject=s;
-  vid.onloadedmetadata=()=>vid.play();
-});
+// Detection constants tuned to YOUR readings
+const BRIGHT_MIN=200;
+const SAT_MAX=0.12;
+const MIN_CLUSTER=5;
+const MAX_CLUSTER=120;
 
-view.onmousemove=e=>{
-  const rect=view.getBoundingClientRect();
-  const x=Math.floor((e.clientX-rect.left)/rect.width*view.width);
-  const y=Math.floor((e.clientY-rect.top)/rect.height*view.height);
-
-  // crop zoom
-  const size=20;
-  zctx.imageSmoothingEnabled=false;
-  zctx.drawImage(view, x-size, y-size, size*2, size*2, 0,0,120,120);
-
-  // pixel info
-  const p=vctx.getImageData(x,y,1,1).data;
-  const [r,g,b]=p;
-  const brightness=(r+g+b)/3|0;
-  const sat=(Math.max(r,g,b)-Math.min(r,g,b))/(Math.max(r,g,b)+1);
-
-  info.textContent=`Pixel @${x},${y} :: R${r} G${g} B${b} | Bright ${brightness} | Sat ${sat.toFixed(2)}`;
+// Start zone right/middle
+const startZone={
+ x:view.width*0.70,
+ y:view.height*0.45,
+ w:view.width*0.16,
+ h:view.height*0.25
 };
 
-// frame loop
+let tracking=false, still=0, kal=null;
+let trail=[], buf=[];
+const delay=5;
+
+// Smooth tiny motion
+const smooth=(a,b)=>!a?b:{x:a.x*0.7+b.x*0.3,y:a.y*0.7+b.y*0.3};
+
+// Camera
+navigator.mediaDevices.getUserMedia({
+ video:{width:{ideal:1920},height:{ideal:1080},facingMode:"environment"},
+ audio:false
+}).then(s=>{
+ vid.srcObject=s;
+ vid.onloadedmetadata=()=>{
+  statusEl.textContent="📷 Ready — put ball in right zone";
+  vid.play();
+  loop();
+};
+});
+
 function loop(){
-  vctx.drawImage(vid,0,0,view.width,view.height);
 
-  // white mask preview
-  const frame=vctx.getImageData(0,0,view.width,view.height);
-  const data=frame.data;
-  const out=mctx.getImageData(0,0,view.width,view.height);
-  const odata=out.data;
+ // Process frame small
+ pctx.drawImage(vid,0,0,proc.width,proc.height);
+ const frame=pctx.getImageData(0,0,proc.width,proc.height).data;
+ const mask=new Uint8Array(proc.width*proc.height);
 
-  for(let i=0;i<data.length;i+=4){
-    const r=data[i],g=data[i+1],b=data[i+2];
-    const brightness=(r+g+b)/3;
-    const sat=(Math.max(r,g,b)-Math.min(r,g,b))/(Math.max(r,g,b)+1);
+ for(let i=0;i<frame.length;i+=4){
+  const r=frame[i],g=frame[i+1],b=frame[i+2];
+  const bright=(r+g+b)/3;
+  const maxC=Math.max(r,g,b), minC=Math.min(r,g,b);
+  const sat=(maxC-minC)/(maxC+1);
 
-    const isWhite = brightness>160 && sat<0.28;
-    odata[i]=odata[i+1]=odata[i+2] = isWhite ? 255 : 0;
-    odata[i+3] = 255;
+  if(bright>BRIGHT_MIN && sat<SAT_MAX){
+    mask[i/4]=1;
   }
-  mctx.putImageData(out,0,0);
+ }
 
-  requestAnimationFrame(loop);
+ // Find ball cluster (tiny blob)
+ let ball=null;
+ for(let y=0;y<proc.height;y++){
+  for(let x=0;x<proc.width;x++){
+    const idx=y*proc.width+x;
+    if(mask[idx]===1){
+      let sx=0,sy=0,count=0;
+      const stack=[[x,y]];
+      mask[idx]=0;
+
+      while(stack.length){
+        const [cx,cy]=stack.pop();
+        const id=cy*proc.width+cx;
+        sx+=cx; sy+=cy; count++;
+
+        for(const [dx,dy] of[[1,0],[-1,0],[0,1],[0,-1]]){
+          let nx=cx+dx,ny=cy+dy;
+          if(nx>=0&&nx<proc.width&&ny>=0&&ny<proc.height){
+            const nid=ny*proc.width+nx;
+            if(mask[nid]===1){ mask[nid]=0; stack.push([nx,ny]); }
+          }
+        }
+      }
+
+      if(count>MIN_CLUSTER && count<MAX_CLUSTER){
+        ball={
+         x:(sx/count)*(view.width/proc.width),
+         y:(sy/count)*(view.height/proc.height)
+        };
+      }
+    }
+  }
+ }
+
+ // Draw mirrored camera
+ vctx.save();
+ vctx.scale(-1,1);
+ vctx.drawImage(vid,-view.width,0,view.width,view.height);
+ vctx.restore();
+
+ // Draw start zone
+ vctx.strokeStyle="#00ff88"; vctx.lineWidth=3;
+ vctx.strokeRect(startZone.x,startZone.y,startZone.w,startZone.h);
+
+ if(ball){
+   const inBox = ball.x>startZone.x && ball.x<startZone.x+startZone.w &&
+                 ball.y>startZone.y && ball.y<startZone.y+startZone.h;
+
+   if(!tracking && inBox){
+     tracking=true;
+     trail=[]; buf=[]; still=0; kal=null;
+     statusEl.textContent="🚀 Ball detected — roll!";
+   }
+
+   if(tracking){
+    kal=smooth(kal,ball);
+    buf.push(kal);
+
+    if(buf.length>delay){
+      const pt=buf.shift();
+      trail.push(pt);
+
+      // draw trail
+      if(trail.length>1){
+        vctx.strokeStyle="#00ff80"; vctx.lineWidth=4;
+        vctx.beginPath();
+        vctx.moveTo(trail[0].x,trail[0].y);
+        for(let i=1;i<trail.length;i++) vctx.lineTo(trail[i].x,trail[i].y);
+        vctx.stroke();
+      }
+
+      // stop detection
+      if(trail.length>5){
+       const d=Math.hypot(
+        trail.at(-1).x-trail.at(-4).x,
+        trail.at(-1).y-trail.at(-4).y
+       );
+       if(d<1.5){
+        still++;
+        if(still>5){
+          tracking=false;
+          const p=trail.at(-1);
+          vctx.strokeStyle="#00ffff"; 
+          vctx.beginPath(); 
+          vctx.arc(p.x,p.y,10,0,2*Math.PI); 
+          vctx.stroke();
+          statusEl.textContent="⛳ Ball stopped";
+        }
+       }
+      }
+    }
+   }
+ }
+
+ requestAnimationFrame(loop);
 }
-loop();
 </script>
-
 </body>
 </html>
