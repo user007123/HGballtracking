@@ -2,205 +2,86 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>HoverGreens Vision — Tiny Ball Tracker (Overhead Mode)</title>
+<title>HoverGreens Vision Debug — Pixel Finder</title>
 <style>
-  body{margin:0;background:#000;color:#fff;text-align:center;font-family:Arial;}
-  h3 {margin-top:10px;}
-  #status{margin:6px;font-size:14px;color:#7dff7d;}
-  canvas{display:block;margin:6px auto;background:#000;}
-  video{display:none}
+  body{margin:0;background:#000;color:#0f0;font-family:Arial;text-align:center;}
+  canvas{background:#000;margin:8px auto;display:block;border:1px solid #333;}
+  #info{margin-top:5px;font-size:14px;}
 </style>
 </head>
 <body>
 
-<h3>HoverGreens Vision — Overhead Ball Tracking</h3>
-<div id="status">Initializing camera…</div>
+<h3>HoverGreens Vision — Ball Pixel Debug Mode</h3>
+<div id="info">Move mouse over ball — checking pixel values…</div>
 
-<video id="cam" autoplay playsinline muted></video>
-
-<!-- Raw detection canvas (not visible in final projection mode) -->
-<canvas id="detect" width="960" height="540"></canvas>
-
-<!-- Projected output (your putting green overlay) -->
-<canvas id="project" width="1180" height="370"></canvas>
+<video id="vid" autoplay playsinline muted style="display:none"></video>
+<canvas id="view" width="960" height="540"></canvas>
+<canvas id="zoom" width="120" height="120"></canvas>
+<canvas id="mask" width="960" height="540"></canvas>
 
 <script>
-const statusEl=document.getElementById("status");
-const video=document.getElementById("cam");
-const detect=document.getElementById("detect");
-const dctx=detect.getContext("2d",{willReadFrequently:true});
-const project=document.getElementById("project");
-const pctx=project.getContext("2d",{willReadFrequently:true});
+const vid=document.getElementById("vid");
+const view=document.getElementById("view");
+const vctx=view.getContext("2d",{willReadFrequently:true});
+const zoom=document.getElementById("zoom");
+const zctx=zoom.getContext("2d",{willReadFrequently:true});
+const mask=document.getElementById("mask");
+const mctx=mask.getContext("2d",{willReadFrequently:true});
+const info=document.getElementById("info");
 
-const DW=detect.width, DH=detect.height;
-let lastMask=null, kalman=null;
-let path=[], tracking=false, stillCount=0, buffer=[];
-const delayFrames=5; // ~80ms lag makes trail feel real on projection
-
-// ✅ Start box on right side for ball placement
-const startBox={
-  x: project.width*0.70,
-  y: project.height*0.45,
-  w: project.width*0.15,
-  h: project.height*0.25
-};
-
-// ✅ Request overhead 1080p camera (with fallback)
+// ✅ camera request with fallback
 navigator.mediaDevices.getUserMedia({
-  video: {
-    width: { ideal: 1920 },
-    height: { ideal: 1080 },
-    facingMode: "environment"
-  },
-  audio: false
-})
-.then(stream=>{
-  video.srcObject=stream;
-  video.onloadedmetadata=()=>{
-    statusEl.textContent="📷 Camera ready — place ball in right box";
-    video.play();
-    requestAnimationFrame(loop);
-  };
-})
-.catch(err=>{
-  statusEl.textContent="❌ Camera access blocked — enable permissions";
-  console.error(err);
+  video:{width:{ideal:1920},height:{ideal:1080},facingMode:"environment"},
+  audio:false
+}).then(s=>{
+  vid.srcObject=s;
+  vid.onloadedmetadata=()=>vid.play();
 });
 
-// ✅ White-ball pixel logic (ball is tiny, must isolate precisely)
-function isBallPixel(r,g,b){
-  const brightness=(r+g+b)/3;
-  if(brightness < 170) return false; // must be bright
-  const maxC=Math.max(r,g,b), minC=Math.min(r,g,b);
-  const sat=(maxC-minC)/(maxC+1);
-  if(sat > 0.28) return false; // must be low-saturation white
-  return true;
-}
+view.onmousemove=e=>{
+  const rect=view.getBoundingClientRect();
+  const x=Math.floor((e.clientX-rect.left)/rect.width*view.width);
+  const y=Math.floor((e.clientY-rect.top)/rect.height*view.height);
 
-// ✅ Find connected blob (tiny ball support)
-function findBall(mask){
-  let best=null;
-  for(let y=0;y<DH;y++){
-    for(let x=0;x<DW;x++){
-      const i=y*DW+x;
-      if(mask[i]===1){
-        let sx=0,sy=0,count=0;
-        const stack=[[x,y]];
-        mask[i]=0;
-        while(stack.length){
-          const [cx,cy]=stack.pop();
-          const idx=cy*DW+cx;
-          sx+=cx; sy+=cy; count++;
-          mask[idx]=0;
-          for(const [nx,ny] of [[1,0],[-1,0],[0,1],[0,-1]]){
-            const xx=cx+nx,yy=cy+ny;
-            if(xx>=0&&xx<DW&&yy>=0&&yy<DH){
-              const ii=yy*DW+xx;
-              if(mask[ii]===1){mask[ii]=0;stack.push([xx,yy]);}
-            }
-          }
-        }
-        if(count>6 && count<500){ // tiny ball allowed
-          best={x:sx/count, y:sy/count, size:count};
-        }
-      }
-    }
-  }
-  return best;
-}
+  // crop zoom
+  const size=20;
+  zctx.imageSmoothingEnabled=false;
+  zctx.drawImage(view, x-size, y-size, size*2, size*2, 0,0,120,120);
 
-// ✅ Simple Kalman-like smoothing
-function smooth(prev,now){ if(!prev) return now;
-  return { x: prev.x*0.7 + now.x*0.3,
-           y: prev.y*0.7 + now.y*0.3 }
-}
+  // pixel info
+  const p=vctx.getImageData(x,y,1,1).data;
+  const [r,g,b]=p;
+  const brightness=(r+g+b)/3|0;
+  const sat=(Math.max(r,g,b)-Math.min(r,g,b))/(Math.max(r,g,b)+1);
 
-// ✅ Main loop
+  info.textContent=`Pixel @${x},${y} :: R${r} G${g} B${b} | Bright ${brightness} | Sat ${sat.toFixed(2)}`;
+};
+
+// frame loop
 function loop(){
-  // Draw video to detection canvas
-  dctx.drawImage(video,0,0,DW,DH);
-  const frame=dctx.getImageData(0,0,DW,DH).data;
+  vctx.drawImage(vid,0,0,view.width,view.height);
 
-  // Build mask
-  const mask=new Uint8Array(DW*DH);
-  for(let i=0;i<frame.length;i+=4){
-    if(isBallPixel(frame[i],frame[i+1],frame[i+2])) mask[i/4]=1;
+  // white mask preview
+  const frame=vctx.getImageData(0,0,view.width,view.height);
+  const data=frame.data;
+  const out=mctx.getImageData(0,0,view.width,view.height);
+  const odata=out.data;
+
+  for(let i=0;i<data.length;i+=4){
+    const r=data[i],g=data[i+1],b=data[i+2];
+    const brightness=(r+g+b)/3;
+    const sat=(Math.max(r,g,b)-Math.min(r,g,b))/(Math.max(r,g,b)+1);
+
+    const isWhite = brightness>160 && sat<0.28;
+    odata[i]=odata[i+1]=odata[i+2] = isWhite ? 255 : 0;
+    odata[i+3] = 255;
   }
-
-  // Find ball blob
-  const blob=findBall(mask.slice());
-  let ball=null;
-  if(blob){
-    // scale detection → projection space
-    ball={ 
-      x: blob.x*(project.width/DW),
-      y: blob.y*(project.height/DH)
-    };
-  }
-
-  // Mirror + draw camera on projection view
-  pctx.save();
-  pctx.scale(-1,1);
-  pctx.drawImage(video,-project.width,0,project.width,project.height);
-  pctx.restore();
-
-  // ✅ Draw start box
-  pctx.strokeStyle="#00ff88"; pctx.lineWidth=3;
-  pctx.strokeRect(startBox.x,startBox.y,startBox.w,startBox.h);
-
-  // ✅ Ball detection
-  if(ball){
-    const inBox = (
-      ball.x>startBox.x && ball.x<startBox.x+startBox.w &&
-      ball.y>startBox.y && ball.y<startBox.y+startBox.h
-    );
-
-    if(!tracking && inBox){
-      tracking=true;
-      path=[]; buffer=[]; stillCount=0; kalman=null;
-      statusEl.textContent="🚀 Ball detected — roll!";
-    }
-
-    if(tracking){
-      kalman=smooth(kalman,ball);
-      buffer.push(kalman);
-
-      if(buffer.length > delayFrames){
-        const pt=buffer.shift();
-        path.push(pt);
-
-        // draw trail
-        if(path.length>1){
-          pctx.strokeStyle="#00ff80"; pctx.lineWidth=4;
-          pctx.beginPath();
-          pctx.moveTo(path[0].x,path[0].y);
-          for(let i=1;i<path.length;i++) pctx.lineTo(path[i].x,path[i].y);
-          pctx.stroke();
-        }
-
-        // detect stop
-        if(path.length>5){
-          const d=Math.hypot(
-            path.at(-1).x - path.at(-4).x,
-            path.at(-1).y - path.at(-4).y
-          );
-          if(d < 1.5){
-            stillCount++;
-            if(stillCount>5){
-              tracking=false;
-              const end=path.at(-1);
-              pctx.strokeStyle="#00ffff"; pctx.lineWidth=4;
-              pctx.beginPath(); pctx.arc(end.x,end.y,10,0,2*Math.PI); pctx.stroke();
-              statusEl.textContent="⛳ Ball stopped";
-            }
-          }
-        }
-      }
-    }
-  }
+  mctx.putImageData(out,0,0);
 
   requestAnimationFrame(loop);
 }
+loop();
 </script>
+
 </body>
 </html>
