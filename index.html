@@ -2,10 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>HoverGreens Vision — Shadow-Tolerant Ball Tracker</title>
+<title>HoverGreens Vision — Sticky Lock v2.0</title>
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: dark }
   body{margin:0;background:#000;color:#fff;font-family:Arial,sans-serif;text-align:center}
   header{padding:10px;display:flex;gap:10px;justify-content:center;align-items:center;flex-wrap:wrap}
   button{background:#111;color:#fff;border:1px solid #333;border-radius:8px;padding:6px 12px;cursor:pointer}
@@ -30,89 +30,67 @@
 
 <script>
 /* ===== DOM ===== */
-const vid  = document.getElementById("cam");
-const proc = document.getElementById("proc");
-const pctx = proc.getContext("2d",{willReadFrequently:true});
-const view = document.getElementById("view");
-const vctx = view.getContext("2d",{willReadFrequently:true});
-const statusEl = document.getElementById("status");
-const resetBtn = document.getElementById("resetBtn");
+const vid=document.getElementById("cam");
+const proc=document.getElementById("proc"), pctx=proc.getContext("2d",{willReadFrequently:true});
+const view=document.getElementById("view"), vctx=view.getContext("2d",{willReadFrequently:true});
+const statusEl=document.getElementById("status");
+const resetBtn=document.getElementById("resetBtn");
 
-/* ===== TUNING =====
-   You said: 1920×1080 overhead, 30fps, white ball on green, single overhead light.
-*/
-const ROI_SIZE        = 50;     // constant tiny ROI (px in view space)
-const BRIGHT_MIN      = 200;    // white ball brightness
-const SAT_MAX         = 0.14;   // near-white saturation
-const AREA_MIN        = 4;      // min bright pixels in ROI
-const AREA_MAX        = 420;    // max bright pixels (reject big putter/shadow)
-const ROUNDNESS_MAX   = 0.65;   // |w-h|/max(w,h) must be <= this
-const CONF_THRESH     = 0.55;   // confidence threshold for "real" detection
+/* ===== TUNING (for ~5 mph max, overhead 1080p @30fps) ===== */
+const ROI_SIZE      = 44;   // constant, tiny lock box
+const BRIGHT_MIN    = 200;  // white ball threshold
+const SAT_MAX       = 0.14; // near-white
+const AREA_MIN      = 4;    // min bright pixels
+const AREA_MAX      = 380;  // max bright pixels (reject putter/shadow)
+const ROUND_MAX     = 0.62; // |w-h|/max(w,h) must be <= this (roundness)
+const CONF_THRESH   = 0.55; // confidence to accept move
 
-const STOP_EPS        = 1.0;    // px motion to count as moving
-const STOP_FRAMES     = 6;      // frames under STOP_EPS → stopped
-const GHOST_HOLD      = 5000;   // ms trace hold after stop
+const STOP_EPS      = 1.0;  // px window to consider stationary
+const STOP_FRAMES   = 6;    // frames under STOP_EPS => stopped
+const GHOST_HOLD    = 5000; // ms hold after stop
 
-// Shadow / dropout handling
-const PREDICT_FRAMES  = 12;     // allow up to 12 frames of prediction through shadow
-const PREDICT_DECAY   = 0.90;   // velocity decay in shadow
-const MIN_SPEED       = 0.4;    // px/frame minimum for meaningful motion
+// Shadow tolerance: hold last good position for up to 4 frames
+const HOLD_FRAMES   = 4;    // no prediction jumps, just hold
+const NUDGE_MAX     = 2;    // optional tiny nudge along last direction (px)
 
 /* ===== STATE ===== */
-let roi = null;                  // {x,y} top-left
-let tracking = false;
-let trail = [];                  // [{x,y,pred:boolean}]
-let lastBall = null;             // {x,y}
-let lastVel  = {x:0,y:0};        // last velocity
-let predictFrames = 0;           // how many predicted frames in a row
-let still = 0;                   // stop detector
-let stopTime = null;             // when stopped to freeze replay
-let lastFrame = null;            // frozen video frame for replay
+let roi=null;                 // {x,y} top-left
+let tracking=false;
+let trail=[];                 // [{x,y}]
+let lastBall=null;
+let lastVel={x:0,y:0};
+let hold=0;                   // frames we’ve held last position
+let still=0;
+let stopTime=null;
+let lastFrame=null;
 
 /* ===== HELPERS ===== */
 const clamp=(v,min,max)=>Math.max(min,Math.min(max,v));
-function toProc(x,y){ // view → proc coords (view is mirrored horizontally)
+function toProc(x,y){ // view -> proc (view is mirrored)
   return {
     px:(view.width - x) * (proc.width / view.width),
     py: y * (proc.height / view.height)
   };
 }
-
 function drawTrail(){
   if(trail.length<2) return;
-  // draw real segments
-  vctx.save();
-  vctx.lineWidth = 4;
+  vctx.strokeStyle="#00ff80";
+  vctx.lineWidth=4;
   vctx.beginPath();
+  vctx.moveTo(trail[0].x, trail[0].y);
   for(let i=1;i<trail.length;i++){
-    const a=trail[i-1], b=trail[i];
-    if(!a.pred && !b.pred){
-      vctx.strokeStyle="#00ff80";
-      vctx.moveTo(a.x,a.y); vctx.lineTo(b.x,b.y);
-    }
+    vctx.lineTo(trail[i].x, trail[i].y);
   }
   vctx.stroke();
-  // draw predicted (shadow) segments lighter
-  vctx.globalAlpha = 0.55;
-  vctx.beginPath();
-  for(let i=1;i<trail.length;i++){
-    const a=trail[i-1], b=trail[i];
-    if(a.pred || b.pred){
-      vctx.strokeStyle="#00ffaa";
-      vctx.moveTo(a.x,a.y); vctx.lineTo(b.x,b.y);
-    }
-  }
-  vctx.stroke();
-  vctx.restore();
 }
 
 /* ===== CAMERA ===== */
 navigator.mediaDevices.getUserMedia({
-  video:{ width:{ideal:1920}, height:{ideal:1080}, frameRate:{ideal:30}, facingMode:"environment" },
+  video:{width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30},facingMode:"environment"},
   audio:false
 }).then(s=>{
   vid.srcObject=s;
-  vid.onloadedmetadata=()=>{ vid.play(); statusEl.textContent="✅ Click the ball to lock ROI"; loop(); };
+  vid.onloadedmetadata=()=>{ vid.play(); statusEl.textContent="✅ Click directly on the ball to lock"; loop(); };
 }).catch(err=>{
   statusEl.textContent="❌ Camera blocked — allow permissions & use HTTPS";
   console.error(err);
@@ -121,38 +99,38 @@ navigator.mediaDevices.getUserMedia({
 /* ===== RESET ===== */
 function resetAll(){
   roi=null; tracking=false; trail=[]; lastBall=null; lastVel={x:0,y:0};
-  predictFrames=0; still=0; stopTime=null; lastFrame=null;
+  hold=0; still=0; stopTime=null; lastFrame=null;
   statusEl.textContent="↺ Reset — click ball to lock";
 }
 resetBtn.onclick=resetAll;
 
-/* ===== CLICK TO LOCK ROI ===== */
+/* ===== CLICK TO LOCK ===== */
 view.addEventListener("click", (e)=>{
   const r=view.getBoundingClientRect();
   const x=(e.clientX-r.left)*(view.width/r.width);
   const y=(e.clientY-r.top)*(view.height/r.height);
   resetAll();
-  roi = { x:x-ROI_SIZE/2, y:y-ROI_SIZE/2 };
-  statusEl.textContent="🎯 Locked — roll the ball";
+  roi={ x:x-ROI_SIZE/2, y:y-ROI_SIZE/2 };
+  statusEl.textContent="🎯 Locked — roll";
 });
 
-/* ===== BALL DETECTION + CONFIDENCE ===== */
+/* ===== DETECTION IN CONSTANT ROI (confidence-weighted) ===== */
 function detectBall(){
   if(!roi) return {found:false};
 
-  // Map ROI to proc coords
+  // map ROI to proc coords
   const pr=toProc(roi.x,roi.y);
   const sx=Math.floor(pr.px), sy=Math.floor(pr.py);
   const sw=Math.floor(ROI_SIZE*(proc.width/view.width));
   const sh=Math.floor(ROI_SIZE*(proc.height/view.height));
 
+  // draw full frame then sample ROI
   pctx.drawImage(vid,0,0,proc.width,proc.height);
-  if(sw<1||sh<1||sx<0||sy<0||sx+sw>proc.width||sy+sh>proc.height){
-    return {found:false};
-  }
+  if(sw<1||sh<1||sx<0||sy<0||sx+sw>proc.width||sy+sh>proc.height) return {found:false};
 
   const img=pctx.getImageData(sx,sy,sw,sh).data;
-  let pts=0, sumX=0, sumY=0, minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9, sumBright=0;
+  let count=0,sumX=0,sumY=0,sumBright=0;
+  let minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
 
   for(let i=0;i<img.length;i+=4){
     const R=img[i],G=img[i+1],B=img[i+2];
@@ -161,44 +139,32 @@ function detectBall(){
 
     if(bright>BRIGHT_MIN && sat<SAT_MAX){
       const px=(i/4)%sw, py=Math.floor((i/4)/sw);
-      pts++; sumX+=px; sumY+=py; sumBright+=bright;
+      count++; sumX+=px; sumY+=py; sumBright+=bright;
       if(px<minX)minX=px; if(px>maxX)maxX=px;
       if(py<minY)minY=py; if(py>maxY)maxY=py;
     }
   }
 
-  if(pts<AREA_MIN || pts>AREA_MAX) return {found:false};
+  if(count<AREA_MIN || count>AREA_MAX) return {found:false};
 
   const w=maxX-minX, h=maxY-minY;
-  if(w>35||h>35) return {found:false};              // reject large blobs
+  if(w>32 || h>32) return {found:false};
   const roundness=Math.abs(w-h)/Math.max(w,h||1);
-  if(roundness>ROUNDNESS_MAX) return {found:false}; // must be roughly round
+  if(roundness>ROUND_MAX) return {found:false};
 
-  // Centroid in view space
-  const cx_proc=sx+(sumX/pts), cy_proc=sy+(sumY/pts);
+  // centroid (proc -> view)
+  const cxp=sx+(sumX/count), cyp=sy+(sumY/count);
   const vx=view.width/proc.width, vy=view.height/proc.height;
-  const cx_view = view.width - (cx_proc * vx);
-  const cy_view = cy_proc * vy;
+  const cx=view.width - (cxp*vx);
+  const cy=cyp*vy;
 
-  // Confidence components
-  const meanBright = sumBright/pts;                  // 0..255
-  const brightScore = Math.min(1, (meanBright-200)/40); // 200→240 maps to 0→1
-  const roundScore  = Math.max(0, 1 - (roundness/ROUNDNESS_MAX)); // 0..1
-  let alignScore = 0.5; // neutral
-  if(lastBall){
-    const dx = cx_view - lastBall.x, dy = cy_view - lastBall.y;
-    const sp = Math.hypot(dx,dy);
-    const lv = Math.hypot(lastVel.x,lastVel.y);
-    if(sp>0.001 && lv>0.001){
-      const cos = (dx*lastVel.x + dy*lastVel.y) / (sp*lv);
-      alignScore = (cos+1)/2; // map [-1..1] -> [0..1]
-    }
-  }
+  // confidence (brightness + roundness; no directional bias to avoid “sticking”)
+  const meanBright=sumBright/count;                 // 0..255
+  const brightScore=Math.min(1,(meanBright-200)/40); // 200→240 => 0→1
+  const roundScore =Math.max(0,1-(roundness/ROUND_MAX)); // 0..1
+  const conf=0.6*brightScore + 0.4*roundScore;
 
-  // Weighted confidence
-  const conf = 0.45*brightScore + 0.35*roundScore + 0.20*alignScore;
-
-  return {found:true, x:cx_view, y:cy_view, conf};
+  return {found:true,x:cx,y:cy,conf};
 }
 
 /* ===== MAIN LOOP ===== */
@@ -206,105 +172,93 @@ function loop(){
   requestAnimationFrame(loop);
   const now=performance.now();
 
-  // Freeze replay
+  // freeze replay (keep full trace visible)
   if(stopTime && now - stopTime < GHOST_HOLD){
     if(lastFrame) vctx.putImageData(lastFrame,0,0);
     drawTrail();
     return;
   }
 
-  // Live video (mirrored)
+  // live video (mirrored)
   vctx.save(); vctx.scale(-1,1);
   vctx.drawImage(vid, -view.width, 0, view.width, view.height);
   vctx.restore();
 
-  // Always draw trail
+  // draw existing trail
   drawTrail();
 
-  // Draw ROI
+  // draw ROI
   if(roi){
     vctx.strokeStyle="#00ff88"; vctx.lineWidth=2;
-    vctx.strokeRect(roi.x, roi.y, ROI_SIZE, ROI_SIZE);
+    vctx.strokeRect(roi.x,roi.y,ROI_SIZE,ROI_SIZE);
   }
 
-  // Run detector
-  const hit = detectBall();
+  // detect
+  const hit=detectBall();
 
   if(hit.found && hit.conf >= CONF_THRESH){
-    // Visible & confident — normal tracking
-    predictFrames = 0;
+    // move immediately with centroid
+    const pt={x:hit.x,y:hit.y};
+    trail.push(pt);
 
-    const point = {x:hit.x, y:hit.y, pred:false};
-    trail.push(point);
+    // ROI follows this frame
+    roi.x=pt.x-ROI_SIZE/2;
+    roi.y=pt.y-ROI_SIZE/2;
 
-    // Update velocity
-    if(lastBall){
-      lastVel = { x: point.x - lastBall.x, y: point.y - lastBall.y };
-    }
-    lastBall = {x:point.x,y:point.y};
-
-    // Keep ROI centered on ball
-    roi.x = point.x - ROI_SIZE/2;
-    roi.y = point.y - ROI_SIZE/2;
-
-    // Draw live ball dot
+    // draw ball dot
     vctx.fillStyle="#00ff6a";
-    vctx.beginPath(); vctx.arc(point.x,point.y,4,0,2*Math.PI); vctx.fill();
+    vctx.beginPath(); vctx.arc(pt.x,pt.y,4,0,2*Math.PI); vctx.fill();
 
-    // Save frame for replay
-    lastFrame = vctx.getImageData(0,0,view.width,view.height);
+    // save for replay
+    lastFrame=vctx.getImageData(0,0,view.width,view.height);
 
-    // Start tracking message
+    // velocity for tiny nudge only (no leaps)
+    if(lastBall){
+      lastVel={x:pt.x-lastBall.x, y:pt.y-lastBall.y};
+    }
+    lastBall=pt;
+    hold=0;
+
     if(!tracking){ tracking=true; statusEl.textContent="🚀 Tracking…"; }
 
-  } else if(tracking && lastBall && Math.hypot(lastVel.x,lastVel.y) > MIN_SPEED && predictFrames < PREDICT_FRAMES){
-    // Shadow/occlusion prediction: push ROI & point along last velocity (decaying)
-    predictFrames++;
-    lastVel.x *= PREDICT_DECAY;
-    lastVel.y *= PREDICT_DECAY;
-
-    const pred = {
-      x: lastBall.x + lastVel.x,
-      y: lastBall.y + lastVel.y,
-      pred:true
-    };
-    trail.push(pred);
-    lastBall = {x:pred.x,y:pred.y};
-
-    roi.x = pred.x - ROI_SIZE/2;
-    roi.y = pred.y - ROI_SIZE/2;
-
-    // (optional) show predicted dot lighter
-    vctx.globalAlpha=0.6;
-    vctx.fillStyle="#00ffaa";
-    vctx.beginPath(); vctx.arc(pred.x,pred.y,4,0,2*Math.PI); vctx.fill();
-    vctx.globalAlpha=1.0;
-
-  } else {
-    // Not confident & no good prediction — don't add to trail, just wait
+  } else if(tracking && lastBall){
+    // short shadow tolerance: hold position (no jump)
+    hold++;
+    if(hold <= HOLD_FRAMES){
+      // optional tiny nudge along last direction, capped
+      const mag=Math.hypot(lastVel.x,lastVel.y);
+      if(mag>0.01){
+        const nx = (lastVel.x/mag) * Math.min(NUDGE_MAX, mag);
+        const ny = (lastVel.y/mag) * Math.min(NUDGE_MAX, mag);
+        roi.x += nx; roi.y += ny;
+        // add a steady point so the trail doesn’t break visually
+        const held={x:lastBall.x+nx, y:lastBall.y+ny};
+        trail.push(held);
+        lastBall=held;
+      } else {
+        // fully hold
+        trail.push(lastBall);
+      }
+    } else {
+      // lost too long; stop tracking (trace stays until reset)
+      tracking=false;
+      statusEl.textContent="⚠️ Lost ball — click to re-lock";
+    }
   }
 
-  // Stop detection (use real+pred points so line is continuous)
+  // stop detection (use trail points as drawn)
   if(trail.length>6){
-    const a = trail.at(-1), b = trail.at(-5);
-    const d = Math.hypot(a.x-b.x, a.y-b.y);
-    still = (d < STOP_EPS) ? still+1 : 0;
-    if(still > STOP_FRAMES){
-      stopTime = now;
-      statusEl.textContent = "⛳ Ball stopped — showing trace";
-      // freeze current frame
-      lastFrame = vctx.getImageData(0,0,view.width,view.height);
+    const a=trail.at(-1), b=trail.at(-5);
+    const d=Math.hypot(a.x-b.x,a.y-b.y);
+    still=(d<STOP_EPS)?still+1:0;
+    if(still>STOP_FRAMES){
+      stopTime=now;
+      statusEl.textContent="⛳ Trace holding";
+      lastFrame=vctx.getImageData(0,0,view.width,view.height);
       return;
     }
   }
 }
-
-/* ===== USER FLOW =====
-1) Click directly on the ball → ROI locks.
-2) Roll the ball. If it passes through a shadow, tracker predicts forward using velocity for ~12 frames.
-3) Full trace is drawn (predicted segments are slightly lighter).
-4) After the ball fully stops, the trace stays for 5 seconds, then clears.
-*/
 </script>
 </body>
 </html>
