@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>HoverGreens Vision — Sticky v3.0 (Ultra-Fast Any-Direction)</title>
+<title>HoverGreens Vision — Adaptive Ball Lock (Shadow-Tolerant)</title>
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <style>
   :root { color-scheme: dark }
@@ -21,53 +21,66 @@
 
 <header>
   <button id="resetBtn">Reset</button>
+  <button id="calBtn" title="Click after ROI is on the ball to auto-calibrate">Calibrate</button>
   <div id="status">Initializing camera…</div>
 </header>
 
-<!-- Camera feed -->
+<!-- Camera -->
 <video id="cam" autoplay playsinline muted></video>
 
-<!-- Low-res processing canvas for speed (downsampled) -->
+<!-- Low-res processing canvas for speed -->
 <canvas id="proc" width="640" height="360"></canvas>
 
 <!-- Display canvas (projection aspect) -->
 <canvas id="view" width="1180" height="370"></canvas>
 
 <script>
-/* ===== DOM ===== */
-const vid=document.getElementById("cam");
-const proc=document.getElementById("proc"), pctx=proc.getContext("2d",{willReadFrequently:true});
-const view=document.getElementById("view"), vctx=view.getContext("2d",{willReadFrequently:true});
-const statusEl=document.getElementById("status");
-const resetBtn=document.getElementById("resetBtn");
+/* ============== DOM ============== */
+const vid   = document.getElementById("cam");
+const proc  = document.getElementById("proc");
+const pctx  = proc.getContext("2d",{willReadFrequently:true});
+const view  = document.getElementById("view");
+const vctx  = view.getContext("2d",{willReadFrequently:true});
+const statusEl = document.getElementById("status");
+const resetBtn = document.getElementById("resetBtn");
+const calBtn   = document.getElementById("calBtn");
 
-/* ===== TUNING (720p @ 60fps, overhead, white ball on green) ===== */
-const ROI_SIZE       = 44;   // constant tiny ROI (view space px)
-const BRIGHT_MIN     = 200;  // white
-const SAT_MAX        = 0.16; // low saturation ≈ white
-const AREA_MIN       = 4;    // minimum candidate pixels
-const AREA_MAX       = 380;  // reject big blobs
-const ROUND_MAX      = 0.62; // roundness gate (|w-h|/max)
-const CONF_THRESH    = 0.50; // accept threshold (keep snappy)
+/* ============== TUNING (fast & sticky) ============== */
+const ROI_SIZE       = 44;     // constant tiny ROI (view px), always centered on ball
+const STOP_EPS       = 0.9;    // px motion threshold to consider still
+const STOP_FRAMES    = 6;      // frames under threshold => stopped
+const GHOST_HOLD     = 5000;   // ms to hold trace after stop
+const HOLD_FRAMES    = 1;      // shadow tolerance (frames). 1 = minimal delay
 
-const STOP_EPS       = 0.9;  // px motion window to consider still
-const STOP_FRAMES    = 6;    // frames under STOP_EPS => stopped
-const GHOST_HOLD     = 5000; // ms hold trace after stop
+// Default (pre-calibration) thresholds for white, round blob
+let BRIGHT_MIN       = 200;    // bright in light
+let SAT_MAX          = 0.16;   // low saturation (near-neutral)
+let AREA_MIN         = 4;
+let AREA_MAX         = 420;
+let ROUND_MAX        = 0.65;   // roundness gate: |w-h|/max(w,h) <= ROUND_MAX
 
-const HOLD_FRAMES    = 1;    // 1-frame shadow tolerance (no hesitation)
-const NUDGE_MAX      = 0;    // no nudge; pure stick to centroid
+// Adaptive calibration deltas (tighten/relax after sampling ball)
+let calActive        = false;
+let calMeanBright    = 220;    // learned mean brightness
+let calMeanSat       = 0.06;   // learned mean saturation
+let calRadius        = 10;     // learned half-extent in px within ROI (view-space approx)
+let calBrightShadow  = 150;    // allowed brightness in shadow after calibration
+let calSatTight      = 0.12;   // tighter neutrality in shadow
+let calRoundTight    = 0.55;   // stricter roundness when brightness is low
+let calAreaPad       = 80;     // expand AREA_MAX a bit if needed
 
-/* ===== STATE ===== */
-let roi=null;                 // {x,y} top-left
-let tracking=false;
-let trail=[];                 // [{x,y}]
-let lastBall=null;
-let lastVel={x:0,y:0};
-let hold=0, still=0;
-let stopTime=null, lastFrame=null;
+/* ============== STATE ============== */
+let roi = null;                // {x,y} top-left of ROI
+let tracking = false;
+let trail = [];                // [{x,y}]
+let lastBall = null;
+let hold = 0;
+let still = 0;
+let stopTime = null;
+let lastFrame = null;
 
-/* ===== HELPERS ===== */
-function toProc(x,y){ // view -> proc (view is mirrored BOTH ways)
+/* ============== Helpers ============== */
+function toProc(x,y){ // view -> proc (view is mirrored both ways)
   return {
     px:(view.width  - x)*(proc.width /view.width),
     py:(view.height - y)*(proc.height/view.height)
@@ -82,191 +95,292 @@ function drawTrail(){
   for(let i=1;i<trail.length;i++) vctx.lineTo(trail[i].x,trail[i].y);
   vctx.stroke();
 }
+function clamp(v,min,max){ return Math.max(min,Math.min(max,v)); }
 
-/* ===== CAMERA (request 1280x720 @ 60fps) ===== */
+/* ============== Camera @ 720p60 request ============== */
 navigator.mediaDevices.getUserMedia({
   video:{
-    width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:60, max:60},
-    facingMode:"environment"
+    width:{ideal:1280}, height:{ideal:720},
+    frameRate:{ideal:60, max:60}, facingMode:"environment"
   },
   audio:false
 }).then(s=>{
-  vid.srcObject=s;
-  vid.onloadedmetadata=()=>{ vid.play(); statusEl.textContent="✅ Click directly on the ball to lock"; loop(); };
+  vid.srcObject = s;
+  vid.onloadedmetadata = ()=>{ vid.play(); statusEl.textContent="✅ Click directly on the ball to lock"; loop(); };
 }).catch(err=>{
-  statusEl.textContent="❌ Camera blocked — allow permissions & use HTTPS";
+  statusEl.textContent = "❌ Camera blocked — allow permissions & use HTTPS";
   console.error(err);
 });
 
-/* ===== RESET ===== */
+/* ============== Reset / Calibrate ============== */
 function resetAll(){
-  roi=null; tracking=false; trail=[]; lastBall=null; lastVel={x:0,y:0};
-  hold=0; still=0; stopTime=null; lastFrame=null;
+  roi=null; tracking=false; trail=[]; lastBall=null; hold=0; still=0;
+  stopTime=null; lastFrame=null;
   statusEl.textContent="↺ Reset — click ball to lock";
 }
-resetBtn.onclick=resetAll;
+resetBtn.onclick = resetAll;
 
-/* ===== CLICK TO LOCK ROI ===== */
+calBtn.onclick = ()=>{
+  if(!roi){ statusEl.textContent="ℹ️ Click the ball first to place the ROI, then press Calibrate"; return; }
+  // Sample current ROI for a few frames to compute brightness/sat/radius
+  statusEl.textContent="🧠 Calibrating (0.3s)… hold ball still";
+  let frames=0, bSum=0, sSum=0, rSum=0, countFrames=0, areaMaxSeen=0;
+
+  const sample = ()=>{
+    if(frames++<18){ // ~0.3s at 60fps
+      const stats = measureROI();
+      if(stats && stats.count>=AREA_MIN){
+        bSum += stats.meanBright;
+        sSum += stats.meanSat;
+        rSum += (stats.radius);
+        areaMaxSeen = Math.max(areaMaxSeen, stats.count);
+        countFrames++;
+      }
+      requestAnimationFrame(sample);
+    } else {
+      if(countFrames>0){
+        calMeanBright = bSum / countFrames;
+        calMeanSat    = sSum / countFrames;
+        calRadius     = rSum / countFrames;
+        calBrightShadow = Math.max(140, calMeanBright - 70); // allow ~70 down in shadow
+        calSatTight     = Math.min(0.14, calMeanSat + 0.04); // slight relax vs mean
+        calRoundTight   = 0.55; // a bit stricter when dim
+        AREA_MAX        = Math.max(AREA_MAX, areaMaxSeen + calAreaPad);
+
+        calActive = true;
+        statusEl.textContent = `✅ Calibrated (B≈${calMeanBright.toFixed(0)}, Sat≈${calMeanSat.toFixed(2)}, r≈${calRadius.toFixed(1)})`;
+      } else {
+        statusEl.textContent = "⚠️ Calibration failed — try again with ROI on the ball";
+      }
+    }
+  };
+  sample();
+};
+
+/* Measure ROI stats: return mean brightness, mean saturation, blob extents & radius (view px approx) */
+function measureROI(){
+  if(!roi) return null;
+  const pr=toProc(roi.x,roi.y);
+  const sw=Math.floor(ROI_SIZE*(proc.width /view.width));
+  const sh=Math.floor(ROI_SIZE*(proc.height/view.height));
+  const sx=Math.floor(pr.px), sy=Math.floor(pr.py);
+
+  pctx.drawImage(vid,0,0,proc.width,proc.height);
+  if(sw<1||sh<1||sx<0||sy<0||sx+sw>proc.width||sy+sh>proc.height) return null;
+
+  const img=pctx.getImageData(sx,sy,sw,sh).data;
+
+  let count=0,sumX=0,sumY=0,sumB=0,sumSat=0;
+  let minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
+
+  for(let i=0;i<img.length;i+=4){
+    const R=img[i],G=img[i+1],B=img[i+2];
+    const bright=(R+G+B)/3;
+    const sat=(Math.max(R,G,B)-Math.min(R,G,B))/(Math.max(R,G,B)+1);
+
+    // include near-white candidate (use generous default gates for measuring)
+    if(bright>150 && sat<0.25){
+      const px=(i/4)%sw, py=Math.floor((i/4)/sw);
+      count++; sumX+=px; sumY+=py; sumB+=bright; sumSat+=sat;
+      if(px<minX)minX=px; if(px>maxX)maxX=px;
+      if(py<minY)minY=py; if(py>maxY)maxY=py;
+    }
+  }
+  if(count<AREA_MIN) return null;
+
+  const w=maxX-minX, h=maxY-minY;
+  // Estimate radius in view px (map proc->view scale)
+  const vx=view.width /proc.width, vy=view.height/proc.height;
+  const rView = 0.25 * ( (w*vx) + (h*vy) );
+
+  return {
+    count,
+    meanBright: sumB/count,
+    meanSat: sumSat/count,
+    radius: rView
+  };
+}
+
+/* ============== Click to place ROI ============== */
 view.addEventListener("click", (e)=>{
   const r=view.getBoundingClientRect();
   const x=(e.clientX-r.left)*(view.width/r.width);
   const y=(e.clientY-r.top)*(view.height/r.height);
   resetAll();
-  roi={ x:x-ROI_SIZE/2, y:y-ROI_SIZE/2 };
-  statusEl.textContent="🎯 Locked — roll";
+  roi = { x:x-ROI_SIZE/2, y:y-ROI_SIZE/2 };
+  statusEl.textContent = "🎯 ROI on ball — roll or press Calibrate";
 });
 
-/* ===== ULTRA-FAST DETECTION in constant ROI
-   1) Try strict bright/round cluster (preferred)
-   2) If not enough/confident: FALLBACK to brightest-20 weighted centroid (snap!)
-===== */
+/* ============== Adaptive Ball Detection in constant ROI ============== */
 function detectBall(){
   if(!roi) return {found:false};
 
-  // Map ROI to proc coords
   const pr=toProc(roi.x,roi.y);
-  const sx=Math.floor(pr.px), sy=Math.floor(pr.py);
   const sw=Math.floor(ROI_SIZE*(proc.width /view.width));
   const sh=Math.floor(ROI_SIZE*(proc.height/view.height));
+  const sx=Math.floor(pr.px), sy=Math.floor(pr.py);
 
-  // Draw full frame -> proc, then sample ROI
   pctx.drawImage(vid,0,0,proc.width,proc.height);
   if(sw<1||sh<1||sx<0||sy<0||sx+sw>proc.width||sy+sh>proc.height) return {found:false};
+
   const img=pctx.getImageData(sx,sy,sw,sh).data;
 
-  // Pass 1 — strict cluster
+  // Collect near-white candidates for two passes
+  const cand = [];
   let count=0,sumX=0,sumY=0,sumB=0,minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
-  const brights=[];
+
   for(let i=0;i<img.length;i+=4){
     const R=img[i],G=img[i+1],B=img[i+2];
     const bright=(R+G+B)/3;
-    const sat=(Math.max(R,G,B)-Math.min(R,G,B))/(Math.max(R,G,B)+1);
+    const maxC=Math.max(R,G,B), minC=Math.min(R,G,B);
+    const sat=(maxC-minC)/(maxC+1);
     const px=(i/4)%sw, py=Math.floor((i/4)/sw);
-    if(bright>BRIGHT_MIN && sat<SAT_MAX){
+
+    // Channel neutrality metric: how similar the channels are (white ≈ equal RGB)
+    const channelDiff = (Math.abs(R-G)+Math.abs(G-B)+Math.abs(B-R))/3;
+
+    // Dual-mode acceptance:
+    // Mode A (bright): bright enough + low sat
+    // Mode B (shadow): neutral + roundness gate will handle later
+    const brightMode = (bright >= BRIGHT_MIN && sat <= SAT_MAX);
+    const neutralMode = (bright >= (calActive ? calBrightShadow : 150)) && ( (channelDiff <= 25) || (sat <= (calActive ? calSatTight : 0.12)) );
+
+    if(brightMode || neutralMode){
+      cand.push({px,py,bright,sat,cd:channelDiff});
       count++; sumX+=px; sumY+=py; sumB+=bright;
       if(px<minX)minX=px; if(px>maxX)maxX=px;
       if(py<minY)minY=py; if(py>maxY)maxY=py;
-      // store for fallback
-      brights.push({px,py,bright});
     }
   }
 
-  function toView(cx_p,cy_p){
-    const vx=view.width /proc.width, vy=view.height/proc.height;
-    return { x:view.width - (cx_p*vx), y:view.height - (cy_p*vy) };
-  }
-
-  // Evaluate strict
-  if(count>=AREA_MIN && count<=AREA_MAX){
-    const w=maxX-minX, h=maxY-minY;
-    if(w<=32 && h<=32){
-      const roundness=Math.abs(w-h)/Math.max(w,h||1);
-      if(roundness<=ROUND_MAX){
-        const cxp=sx+(sumX/count), cyp=sy+(sumY/count);
-        const {x:cx,y:cy}=toView(cxp,cyp);
-        const meanB=sumB/count;
-        const brightScore=Math.min(1,(meanB-200)/40);
-        const roundScore =Math.max(0,1-(roundness/ROUND_MAX));
-        const conf=0.6*brightScore+0.4*roundScore;
-        if(conf>=CONF_THRESH) return {found:true,x:cx,y:cy,conf};
+  if(count<AREA_MIN || count>AREA_MAX) {
+    // fallback snap to brightest 20 to stay responsive
+    if(cand.length>0){
+      cand.sort((a,b)=>b.bright-a.bright);
+      const top=cand.slice(0, Math.min(20,cand.length));
+      let wsum=0,cxw=0,cyw=0;
+      for(const p of top){ const w=Math.max(1,p.bright-(calActive?calBrightShadow:180)); wsum+=w; cxw+=p.px*w; cyw+=p.py*w; }
+      if(wsum>0){
+        const cxp=sx+(cxw/wsum), cyp=sy+(cyw/wsum);
+        const vx=view.width /proc.width, vy=view.height/proc.height;
+        return {found:true, x:view.width-(cxp*vx), y:view.height-(cyp*vy), conf:0.5};
       }
     }
+    return {found:false};
   }
 
-  // Pass 2 — SNAP fallback: top 20 brightest weighted centroid
-  if(brights.length>0){
-    brights.sort((a,b)=>b.bright-a.bright);
-    const top=brights.slice(0, Math.min(20, brights.length));
-    let wsum=0, cxw=0, cyw=0;
-    for(const p of top){
-      const w=Math.max(1, p.bright-200); // weight by brightness above 200
-      wsum+=w; cxw+=p.px*w; cyw+=p.py*w;
+  // Roundness / size gate
+  const w=maxX-minX, h=maxY-minY;
+  if(w>32 || h>32) return {found:false};
+  const roundness = Math.abs(w-h)/Math.max(w,h||1);
+
+  // In shadow (dimmer): require tighter neutrality/roundness if we calibrated
+  if(calActive){
+    const meanB = sumB/count;
+    if(meanB < calMeanBright - 35){
+      if(roundness > calRoundTight) return {found:false};
+    } else {
+      if(roundness > ROUND_MAX) return {found:false};
     }
-    if(wsum>0){
-      const cxp=sx+(cxw/wsum), cyp=sy+(cyw/wsum);
-      const {x:cx,y:cy}=toView(cxp,cyp);
-      // Treat fallback as lower-confidence but acceptable for snap
-      return {found:true,x:cx,y:cy,conf:0.5};
-    }
+  } else {
+    if(roundness > ROUND_MAX) return {found:false};
   }
 
-  return {found:false};
+  // Centroid (proc->view)
+  const cxp=sx+(sumX/count), cyp=sy+(sumY/count);
+  const vx=view.width /proc.width, vy=view.height/proc.height;
+  const cx = view.width  - (cxp*vx);
+  const cy = view.height - (cyp*vy);
+
+  // Confidence blending (brightness + neutrality + roundness)
+  const meanB = sumB/count;
+  const meanSat = cand.reduce((a,p)=>a+p.sat,0)/cand.length;
+  const brightScore = calActive
+    ? Math.min(1, (meanB - calBrightShadow)/50)
+    : Math.min(1, (meanB - 200)/40);
+  const neutralScore = Math.max(0, 1 - (meanSat / (calActive ? Math.max(0.06,calSatTight) : 0.16)));
+  const roundScore   = Math.max(0, 1 - (roundness / (calActive ? calRoundTight : ROUND_MAX)));
+  const conf         = 0.45*brightScore + 0.35*neutralScore + 0.20*roundScore;
+
+  return {found:true, x:cx, y:cy, conf};
 }
 
-/* ===== MAIN LOOP ===== */
+/* ============== Main Loop ============== */
 function loop(){
   requestAnimationFrame(loop);
   const now=performance.now();
 
-  // 5s freeze replay
+  // Freeze replay (show last frame + full trail)
   if(stopTime && now - stopTime < GHOST_HOLD){
     if(lastFrame) vctx.putImageData(lastFrame,0,0);
     drawTrail();
     return;
   }
 
-  // Draw live video flipped horizontally & vertically for overhead
+  // Draw live video flipped horizontally & vertically (overhead)
   vctx.save();
   vctx.scale(-1,-1);
   vctx.drawImage(vid, -view.width, -view.height, view.width, view.height);
   vctx.restore();
 
-  // Draw existing trail
+  // Draw current trail
   drawTrail();
 
   // Draw ROI
-  if(roi){ vctx.strokeStyle="#00ff88"; vctx.lineWidth=2; vctx.strokeRect(roi.x,roi.y,ROI_SIZE,ROI_SIZE); }
+  if(roi){
+    vctx.strokeStyle="#00ff88"; vctx.lineWidth=2;
+    vctx.strokeRect(roi.x,roi.y,ROI_SIZE,ROI_SIZE);
+  }
 
-  // Detect ball (strict -> snap fallback)
-  const hit=detectBall();
+  // Detect ball (adaptive)
+  const hit = detectBall();
 
-  if(hit.found && hit.conf>=0.5){ // accept fallback too
-    const pt={x:hit.x,y:hit.y};
-    trail.push(pt);                           // add to trace immediately
-    // update velocity (for future use / diagnostics)
-    if(lastBall){ lastVel={x:pt.x-lastBall.x, y:pt.y-lastBall.y}; }
-    lastBall=pt;
+  if(hit.found && hit.conf >= 0.5){
+    const pt = {x:hit.x,y:hit.y};
+    trail.push(pt);
 
-    // ALWAYS center ROI on ball this frame (zero inertia)
-    roi.x=pt.x-ROI_SIZE/2;
-    roi.y=pt.y-ROI_SIZE/2;
+    // Always center ROI immediately
+    roi.x = pt.x - ROI_SIZE/2;
+    roi.y = pt.y - ROI_SIZE/2;
 
-    // Draw small dot on ball
+    // Draw ball dot
     vctx.fillStyle="#00ff6a";
     vctx.beginPath(); vctx.arc(pt.x,pt.y,4,0,2*Math.PI); vctx.fill();
 
-    // Save frame for replay
-    lastFrame=vctx.getImageData(0,0,view.width,view.height);
+    // Save for replay
+    lastFrame = vctx.getImageData(0,0,view.width,view.height);
 
-    if(!tracking){ tracking=true; statusEl.textContent="🚀 Tracking (60fps)"; }
-    hold=0;
+    if(!tracking){ tracking=true; statusEl.textContent="🚀 Tracking (Adaptive)"; }
+    hold = 0;
 
   } else if(tracking && lastBall){
-    // 1-frame hold for shadow — no nudging (pure hold)
+    // minimal hold (no prediction) to bridge a shadow frame
     hold++;
-    if(hold<=HOLD_FRAMES){
-      trail.push(lastBall); // keep line continuous
-      // keep ROI where it was (centered on lastBall)
-      roi.x=lastBall.x-ROI_SIZE/2;
-      roi.y=lastBall.y-ROI_SIZE/2;
+    if(hold <= HOLD_FRAMES){
+      trail.push(lastBall);
+      roi.x = lastBall.x - ROI_SIZE/2;
+      roi.y = lastBall.y - ROI_SIZE/2;
     } else {
-      tracking=false;
-      statusEl.textContent="⚠️ Lost — click to re-lock";
+      tracking = false;
+      statusEl.textContent = "⚠️ Lost — click to re-lock (try Calibrate)";
     }
   }
 
-  // Stop detection (line-based, robust to 60fps)
+  // Stop detection (line-based)
   if(trail.length>6){
     const a=trail.at(-1), b=trail.at(-5);
     const d=Math.hypot(a.x-b.x, a.y-b.y);
-    still=(d<STOP_EPS)?still+1:0;
-    if(still>STOP_FRAMES){
-      stopTime=now;
-      statusEl.textContent="⛳ Ball stopped — holding trace";
-      lastFrame=vctx.getImageData(0,0,view.width,view.height);
+    still = (d<STOP_EPS)? still+1 : 0;
+    if(still > STOP_FRAMES){
+      stopTime = now;
+      statusEl.textContent = "⛳ Ball stopped — Trace holding";
+      lastFrame = vctx.getImageData(0,0,view.width,view.height);
       return;
     }
   }
+
+  // Remember last ball (end of frame)
+  if(trail.length>0) lastBall = trail.at(-1);
 }
 </script>
 </body>
