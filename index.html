@@ -5,6 +5,7 @@
 <title>HoverGreens Vision — Tiny Ball Tracker (Overhead Mode)</title>
 <style>
   body{margin:0;background:#000;color:#fff;text-align:center;font-family:Arial;}
+  h3 {margin-top:10px;}
   #status{margin:6px;font-size:14px;color:#7dff7d;}
   canvas{display:block;margin:6px auto;background:#000;}
   video{display:none}
@@ -12,15 +13,18 @@
 </head>
 <body>
 
-<h3>HoverGreens Vision — Overhead Tracker</h3>
+<h3>HoverGreens Vision — Overhead Ball Tracking</h3>
 <div id="status">Initializing camera…</div>
 
 <video id="cam" autoplay playsinline muted></video>
-<canvas id="detect" width="960" height="540"></canvas> <!-- internal detection -->
-<canvas id="project" width="1180" height="370"></canvas> <!-- projection output -->
+
+<!-- Raw detection canvas (not visible in final projection mode) -->
+<canvas id="detect" width="960" height="540"></canvas>
+
+<!-- Projected output (your putting green overlay) -->
+<canvas id="project" width="1180" height="370"></canvas>
 
 <script>
-// ------------------- setup --------------------
 const statusEl=document.getElementById("status");
 const video=document.getElementById("cam");
 const detect=document.getElementById("detect");
@@ -31,27 +35,49 @@ const pctx=project.getContext("2d",{willReadFrequently:true});
 const DW=detect.width, DH=detect.height;
 let lastMask=null, kalman=null;
 let path=[], tracking=false, stillCount=0, buffer=[];
-const delayFrames=5; // ~80ms at 60fps
+const delayFrames=5; // ~80ms lag makes trail feel real on projection
 
-// Start box (right middle)
+// ✅ Start box on right side for ball placement
 const startBox={
-  x:project.width*0.7,
-  y:project.height*0.45,
-  w:project.width*0.15,
-  h:project.height*0.25
+  x: project.width*0.70,
+  y: project.height*0.45,
+  w: project.width*0.15,
+  h: project.height*0.25
 };
 
-// HSV threshold for white ball
+// ✅ Request overhead 1080p camera (with fallback)
+navigator.mediaDevices.getUserMedia({
+  video: {
+    width: { ideal: 1920 },
+    height: { ideal: 1080 },
+    facingMode: "environment"
+  },
+  audio: false
+})
+.then(stream=>{
+  video.srcObject=stream;
+  video.onloadedmetadata=()=>{
+    statusEl.textContent="📷 Camera ready — place ball in right box";
+    video.play();
+    requestAnimationFrame(loop);
+  };
+})
+.catch(err=>{
+  statusEl.textContent="❌ Camera access blocked — enable permissions";
+  console.error(err);
+});
+
+// ✅ White-ball pixel logic (ball is tiny, must isolate precisely)
 function isBallPixel(r,g,b){
   const brightness=(r+g+b)/3;
-  if(brightness<180) return false;
+  if(brightness < 170) return false; // must be bright
   const maxC=Math.max(r,g,b), minC=Math.min(r,g,b);
   const sat=(maxC-minC)/(maxC+1);
-  if(sat>0.25) return false; // white-ish only
+  if(sat > 0.28) return false; // must be low-saturation white
   return true;
 }
 
-// Connected blob find
+// ✅ Find connected blob (tiny ball support)
 function findBall(mask){
   let best=null;
   for(let y=0;y<DH;y++){
@@ -70,13 +96,12 @@ function findBall(mask){
             const xx=cx+nx,yy=cy+ny;
             if(xx>=0&&xx<DW&&yy>=0&&yy<DH){
               const ii=yy*DW+xx;
-              if(mask[ii]===1){ mask[ii]=0; stack.push([xx,yy]); }
+              if(mask[ii]===1){mask[ii]=0;stack.push([xx,yy]);}
             }
           }
         }
-        if(count>8&&count<400){
-          const cx=sx/count, cy=sy/count;
-          best={x:cx,y:cy,size:count};
+        if(count>6 && count<500){ // tiny ball allowed
+          best={x:sx/count, y:sy/count, size:count};
         }
       }
     }
@@ -84,75 +109,67 @@ function findBall(mask){
   return best;
 }
 
-// Basic kalman smoother
-function kf(prev,pt){
-  if(!prev) return pt;
-  return {
-    x: prev.x*0.7 + pt.x*0.3,
-    y: prev.y*0.7 + pt.y*0.3
-  };
+// ✅ Simple Kalman-like smoothing
+function smooth(prev,now){ if(!prev) return now;
+  return { x: prev.x*0.7 + now.x*0.3,
+           y: prev.y*0.7 + now.y*0.3 }
 }
 
-// Camera on
-navigator.mediaDevices.getUserMedia({video:{resolution:{width:1920,height:1080}},audio:false})
-.then(stream=>{
-  video.srcObject=stream;
-  video.onloadedmetadata=()=>requestAnimationFrame(loop);
-});
-
-// ------------------- main loop --------------------
+// ✅ Main loop
 function loop(){
-  // Read frame to detection canvas
+  // Draw video to detection canvas
   dctx.drawImage(video,0,0,DW,DH);
-  const frame=dctx.getImageData(0,0,DW,DH);
-  const data=frame.data;
+  const frame=dctx.getImageData(0,0,DW,DH).data;
 
-  // Build binary mask for ball
+  // Build mask
   const mask=new Uint8Array(DW*DH);
-  for(let i=0;i<data.length;i+=4){
-    const r=data[i],g=data[i+1],b=data[i+2];
-    if(isBallPixel(r,g,b)) mask[i/4]=1;
+  for(let i=0;i<frame.length;i+=4){
+    if(isBallPixel(frame[i],frame[i+1],frame[i+2])) mask[i/4]=1;
   }
 
-  // Find blob = ball candidate
+  // Find ball blob
   const blob=findBall(mask.slice());
-  let ballPix=null;
+  let ball=null;
   if(blob){
-    // convert to projection coords
-    const x=blob.x*(project.width/DW);
-    const y=blob.y*(project.height/DH);
-    ballPix={x,y};
+    // scale detection → projection space
+    ball={ 
+      x: blob.x*(project.width/DW),
+      y: blob.y*(project.height/DH)
+    };
   }
 
-  // Draw mirror video for projection reference
+  // Mirror + draw camera on projection view
   pctx.save();
   pctx.scale(-1,1);
   pctx.drawImage(video,-project.width,0,project.width,project.height);
   pctx.restore();
 
-  // Draw start zone
+  // ✅ Draw start box
   pctx.strokeStyle="#00ff88"; pctx.lineWidth=3;
   pctx.strokeRect(startBox.x,startBox.y,startBox.w,startBox.h);
 
-  if(ballPix){
-    const inBox =
-      ballPix.x>startBox.x && ballPix.x<startBox.x+startBox.w &&
-      ballPix.y>startBox.y && ballPix.y<startBox.y+startBox.h;
+  // ✅ Ball detection
+  if(ball){
+    const inBox = (
+      ball.x>startBox.x && ball.x<startBox.x+startBox.w &&
+      ball.y>startBox.y && ball.y<startBox.y+startBox.h
+    );
 
     if(!tracking && inBox){
-      tracking=true; path=[]; stillCount=0;
+      tracking=true;
+      path=[]; buffer=[]; stillCount=0; kalman=null;
       statusEl.textContent="🚀 Ball detected — roll!";
     }
 
     if(tracking){
-      kalman=kf(kalman,ballPix);
+      kalman=smooth(kalman,ball);
       buffer.push(kalman);
 
-      if(buffer.length>delayFrames){
+      if(buffer.length > delayFrames){
         const pt=buffer.shift();
         path.push(pt);
 
-        // draw green trace trail
+        // draw trail
         if(path.length>1){
           pctx.strokeStyle="#00ff80"; pctx.lineWidth=4;
           pctx.beginPath();
@@ -162,20 +179,19 @@ function loop(){
         }
 
         // detect stop
-        if(path.length>4){
-          const d = Math.hypot(
+        if(path.length>5){
+          const d=Math.hypot(
             path.at(-1).x - path.at(-4).x,
             path.at(-1).y - path.at(-4).y
           );
-          if(d<2){
+          if(d < 1.5){
             stillCount++;
-            if(stillCount>6){
+            if(stillCount>5){
               tracking=false;
-              statusEl.textContent="⛳ Ball stopped";
-              // blue finish circle
               const end=path.at(-1);
               pctx.strokeStyle="#00ffff"; pctx.lineWidth=4;
-              pctx.beginPath(); pctx.arc(end.x,end.y,12,0,2*Math.PI); pctx.stroke();
+              pctx.beginPath(); pctx.arc(end.x,end.y,10,0,2*Math.PI); pctx.stroke();
+              statusEl.textContent="⛳ Ball stopped";
             }
           }
         }
