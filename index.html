@@ -29,6 +29,7 @@
 <canvas id="view" width="1180" height="370"></canvas>
 
 <script>
+// ===== DOM =====
 const statusEl=document.getElementById("status");
 const resetBtn=document.getElementById("resetBtn");
 const vid=document.getElementById("cam");
@@ -37,47 +38,56 @@ const pctx=proc.getContext("2d",{willReadFrequently:true});
 const view=document.getElementById("view");
 const vctx=view.getContext("2d",{willReadFrequently:true});
 
-const BRIGHT_MIN=200, SAT_MAX=0.12;
-const ROI_SIZE=40;
+// ===== Tuned Thresholds =====
+const BRIGHT_MIN=200;   // ball brightness
+const SAT_MAX=0.12;     // ball very white
+const ROI_SIZE=40;      // tiny lock window
 const BUF_DELAY=3;
 const STOP_FRAMES=6, STOP_EPS=1.2;
 
+// ===== State =====
 let roi=null; // {x,y}
 let tracking=false, kal=null, trail=[], buf=[], still=0;
+let lastBall=null, lostFrames=0;
 
 const clamp=(v,min,max)=>Math.max(min,Math.min(max,v));
 const smooth=(a,b)=>!a?b:{x:a.x*0.7+b.x*0.3,y:a.y*0.7+b.y*0.3};
 
-// camera
+// ===== Camera =====
 navigator.mediaDevices.getUserMedia({
- video:{width:{ideal:1920},height:{ideal:1080},facingMode:"environment"},audio:false
-}).then(s=>{
- vid.srcObject=s;
- vid.onloadedmetadata=()=>{vid.play(); statusEl.textContent="✅ Click on ball to lock ROI"; loop();}
+ video:{width:{ideal:1920},height:{ideal:1080},facingMode:"environment"},
+ audio:false
+}).then(stream=>{
+ vid.srcObject=stream;
+ vid.onloadedmetadata=()=>{vid.play(); statusEl.textContent="✅ Click the ball to lock ROI"; loop();}
 });
 
-// click ball
+// ===== Click ball to lock ROI =====
 view.onclick=e=>{
  const r=view.getBoundingClientRect();
  const x=(e.clientX-r.left)*(view.width/r.width);
  const y=(e.clientY-r.top)*(view.height/r.height);
+
  roi={x:x-ROI_SIZE/2,y:y-ROI_SIZE/2};
- tracking=false; kal=null; trail=[]; buf=[]; still=0;
+ tracking=false;kal=null;trail=[];buf=[];still=0;lostFrames=0;
  statusEl.textContent="🎯 Ball locked — roll!";
 };
 
-// reset
+// ===== Reset =====
 resetBtn.onclick=()=>{
- roi=null; tracking=false; trail=[]; buf=[]; kal=null; still=0;
- statusEl.textContent="↺ Reset — click ball";
+ roi=null;tracking=false;trail=[];buf=[];kal=null;still=0;lostFrames=0;
+ statusEl.textContent="↺ Reset — click the ball";
 };
 
-// convert view coords to proc coords
-const toProc = (x,y)=>({
- px:(view.width-x)*(proc.width/view.width),
- py:y*(proc.height/view.height)
-});
+// ===== Coord convert =====
+function toProc(x,y){
+ return {
+   px:(view.width-x)*(proc.width/view.width),
+   py:y*(proc.height/view.height)
+ }
+}
 
+// ===== Ball detector =====
 function findBall(){
  if(!roi) return null;
 
@@ -91,22 +101,22 @@ function findBall(){
  let pts=[];
 
  for(let i=0;i<img.length;i+=4){
-   const r=img[i],g=img[i+1],b=img[i+2];
-   const bright=(r+g+b)/3;
-   const sat=(Math.max(r,g,b)-Math.min(r,g,b))/(Math.max(r,g,b)+1);
+   const R=img[i],G=img[i+1],B=img[i+2];
+   const bright=(R+G+B)/3;
+   const sat=(Math.max(R,G,B)-Math.min(R,G,B))/(Math.max(R,G,B)+1);
    if(bright>BRIGHT_MIN && sat<SAT_MAX){
      const px=(i/4)%sw, py=Math.floor((i/4)/sw);
      pts.push({px,py});
    }
  }
 
- if(pts.length < 3 || pts.length > 250) return null;
+ if(pts.length<3||pts.length>250) return null;
 
  const xs=pts.map(p=>p.px), ys=pts.map(p=>p.py);
  const w=Math.max(...xs)-Math.min(...xs);
  const h=Math.max(...ys)-Math.min(...ys);
- if(w>24||h>24) return null;
- if(Math.abs(w-h)/Math.max(w,h) > 0.55) return null;
+ if(w>24||h>24) return null;               // reject putter head
+ if(Math.abs(w-h)/Math.max(w,h)>0.55) return null; // must be roundish
 
  const cx=pts.reduce((a,p)=>a+p.px,0)/pts.length;
  const cy=pts.reduce((a,p)=>a+p.py,0)/pts.length;
@@ -114,24 +124,32 @@ function findBall(){
  const vx=view.width/proc.width, vy=view.height/proc.height;
  const cxv=view.width-((sx+cx)*vx);
  const cyv=(sy+cy)*vy;
+
  return {x:cxv,y:cyv};
 }
 
+// ===== Main Loop =====
 function loop(){
+ // Draw mirrored video
  vctx.save(); vctx.scale(-1,1);
  vctx.drawImage(vid,-view.width,0,view.width,view.height);
  vctx.restore();
 
+ // Draw ROI
  if(roi){
-   vctx.strokeStyle="#00ff88"; vctx.lineWidth=2;
+   vctx.strokeStyle="#00ff88";vctx.lineWidth=2;
    vctx.strokeRect(roi.x,roi.y,ROI_SIZE,ROI_SIZE);
  }
 
  const ball=findBall();
 
+ // --- Ball present ---
  if(ball){
+   lastBall=ball;
+   lostFrames=0;
+
    if(!tracking){
-     tracking=true; trail=[]; buf=[]; kal=null; still=0;
+     tracking=true;trail=[];buf=[];kal=null;still=0;
      statusEl.textContent="🚀 Tracking…";
    }
 
@@ -139,38 +157,51 @@ function loop(){
    buf.push(kal);
 
    if(buf.length>BUF_DELAY){
-    const pt=buf.shift();
-    trail.push(pt);
+     const pt=buf.shift();
+     trail.push(pt);
 
-    // draw trail behind ROI
-    vctx.strokeStyle="#00ff80"; vctx.lineWidth=4;
-    vctx.beginPath();
-    for(let i=1;i<trail.length;i++){
-      vctx.moveTo(trail[i-1].x,trail[i-1].y);
-      vctx.lineTo(trail[i].x,trail[i].y);
-    }
-    vctx.stroke();
+     vctx.strokeStyle="#00ff80";vctx.lineWidth=4;
+     vctx.beginPath();
+     for(let i=1;i<trail.length;i++){
+       vctx.moveTo(trail[i-1].x,trail[i-1].y);
+       vctx.lineTo(trail[i].x,trail[i].y);
+     }
+     vctx.stroke();
 
-    // move ROI WITH ball
-    roi.x = pt.x - ROI_SIZE/2;
-    roi.y = pt.y - ROI_SIZE/2;
-  }
+     // Move tiny ROI WITH ball
+     roi.x = pt.x - ROI_SIZE/2;
+     roi.y = pt.y - ROI_SIZE/2;
+   }
 
+   // Draw highlighted ball
    vctx.fillStyle="#00ff6a";
    vctx.beginPath(); vctx.arc(ball.x,ball.y,4,0,2*Math.PI); vctx.fill();
 
+   // Stop detection
    if(trail.length>6){
-    const d=Math.hypot(trail.at(-1).x-trail.at(-5).x,
-                       trail.at(-1).y-trail.at(-5).y);
-    if(d<STOP_EPS) still++;
-    else still=0;
-    if(still>STOP_FRAMES){
-      tracking=false;
-      const end=trail.at(-1);
-      vctx.strokeStyle="#00ffff"; vctx.lineWidth=4;
-      vctx.beginPath(); vctx.arc(end.x,end.y,8,0,2*Math.PI); vctx.stroke();
-      statusEl.textContent="⛳ Ball stopped — reset if needed";
-    }
+     const d=Math.hypot(trail.at(-1).x-trail.at(-5).x,
+                        trail.at(-1).y-trail.at(-5).y);
+     if(d<STOP_EPS) still++;
+     else still=0;
+     if(still>STOP_FRAMES){
+       tracking=false;
+       const end=trail.at(-1);
+       vctx.strokeStyle="#00ffff";vctx.lineWidth=4;
+       vctx.beginPath();vctx.arc(end.x,end.y,8,0,2*Math.PI);vctx.stroke();
+       statusEl.textContent="⛳ Ball stopped";
+     }
+   }
+
+ // --- Ball missing temporarily (impact dropout) ---
+ } else if(tracking && lastBall){
+   lostFrames++;
+   if(lostFrames<3){
+     // momentum prediction — move ROI toward last ball position
+     roi.x += (lastBall.x - (roi.x + ROI_SIZE/2)) * 0.5;
+     roi.y += (lastBall.y - (roi.y + ROI_SIZE/2)) * 0.5;
+   } else {
+     tracking=false;
+     statusEl.textContent="⚠️ Lost ball — click again";
    }
  }
 
