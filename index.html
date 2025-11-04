@@ -2,143 +2,72 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>HoverGreens Ball Tracker (Stable Core)</title>
+<title>HoverGreens Ball Color Sampler</title>
 <style>
-  body{background:#000;color:#0f0;font-family:Arial;text-align:center;margin:0;}
-  button{margin:6px;padding:8px 14px;border:1px solid #0f0;background:#000;color:#0f0;cursor:pointer;border-radius:6px;}
-  #status{font-size:14px;margin-top:6px;}
-  canvas{display:block;margin:6px auto;background:#000;}
-  video{display:none;}
+  body { background:#000; color:#0f0; font-family:Arial; text-align:center; margin:0; }
+  #info { font-size:18px; margin-top:10px; }
+  video { display:none; }
+  canvas { border:2px solid #0f0; margin-top:10px; cursor:crosshair; }
 </style>
 </head>
 <body>
 
-<button id="reset">Reset</button>
-<div id="status">Starting camera…</div>
+<h2>🎯 Hover cursor over BALL, then over TURF</h2>
+<div id="info">Initializing Camera...</div>
 
 <video id="cam" autoplay playsinline muted></video>
-<canvas id="proc" width="640" height="360"></canvas>
 <canvas id="view" width="1180" height="370"></canvas>
 
 <script>
-const vid=document.getElementById("cam");
-const proc=document.getElementById("proc"), pctx=proc.getContext("2d",{willReadFrequently:true});
-const view=document.getElementById("view"), vctx=view.getContext("2d",{willReadFrequently:true});
-const status=document.getElementById("status");
-const resetBtn=document.getElementById("reset");
+const video = document.getElementById("cam");
+const canvas = document.getElementById("view");
+const ctx = canvas.getContext("2d", { willReadFrequently:true });
+const info = document.getElementById("info");
 
-// === Tuning === //
-const ROI_SIZE = 42;      // tune 32–52
-const STOP_FRAMES = 5;
-const HOLD = 1;           // shadow tolerance, 1 = best speed
-const BRIGHT_MIN = 150;   // tune 130–190
-const SAT_MAX = 40;       // tune lower = stricter white detection
-const RND_MAX = 0.58;     // tune ~0.5–0.65
-
-let roi=null, tracking=false, trail=[], lastBall=null, still=0, hold=0, stopT=null, lastFrame=null;
-
-resetBtn.onclick=()=>{
-  roi=null;tracking=false;trail=[];lastBall=null;still=0;hold=0;stopT=null;
-  status.textContent="Click ball to lock";
-};
-
-view.addEventListener("click",e=>{
-  const r=view.getBoundingClientRect();
-  const x=(e.clientX-r.left)*(view.width/r.width);
-  const y=(e.clientY-r.top)*(view.height/r.height);
-  roi={x:x-ROI_SIZE/2,y:y-ROI_SIZE/2};
-  status.textContent="Tracking…";
-});
-
+// *** BEGIN CAMERA ***
 navigator.mediaDevices.getUserMedia({
-  video:{width:{ideal:1280},height:{ideal:720},frameRate:{ideal:60,max:60}},
+  video:{
+    width:{ideal:1280},
+    height:{ideal:720},
+    frameRate:{ideal:60, max:60},
+    facingMode:"environment"
+  },
   audio:false
-}).then(s=>{
-  vid.srcObject=s;
-  vid.onloadedmetadata=()=>{vid.play();status.textContent="Click ball to lock";loop();}
+}).then(stream=>{
+  video.srcObject = stream;
+  video.onloadedmetadata = ()=>{ video.play(); draw(); info.textContent="✅ Hover on Ball & Turf to read values"; };
+}).catch(err=>{
+  info.textContent = "❌ Camera blocked";
 });
 
-function drawTrail(){
-  if(trail.length<2)return;
-  vctx.strokeStyle="#0f0";vctx.lineWidth=3;
-  vctx.beginPath();vctx.moveTo(trail[0].x,trail[0].y);
-  for(let i=1;i<trail.length;i++)vctx.lineTo(trail[i].x,trail[i].y);
-  vctx.stroke();
+// *** DRAW LOOP ***
+function draw(){
+  requestAnimationFrame(draw);
+  ctx.save();
+  ctx.scale(-1,-1); // mirror for overhead
+  ctx.drawImage(video, -canvas.width, -canvas.height, canvas.width, canvas.height);
+  ctx.restore();
 }
 
-function detect(){
-  if(!roi)return{f:false};
-  pctx.drawImage(vid,0,0,proc.width,proc.height);
-  const sx=Math.floor(roi.x*(proc.width/view.width)), sy=Math.floor(roi.y*(proc.height/view.height));
-  const sw=Math.floor(ROI_SIZE*(proc.width/view.width)), sh=Math.floor(ROI_SIZE*(proc.height/view.height));
-  if(sw<2||sh<2)return{f:false};
+// *** CONVERT & DISPLAY PIXEL DATA ***
+canvas.addEventListener("mousemove", e => {
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (canvas.width/rect.width);
+  const y = (e.clientY - rect.top) * (canvas.height/rect.height);
 
-  const d=pctx.getImageData(sx,sy,sw,sh).data;
-  let pts=[],sumx=0,sumy=0,count=0,minx=99, maxx=-1, miny=99, maxy=-1;
-  
-  for(let i=0;i<d.length;i+=4){
-    const R=d[i],G=d[i+1],B=d[i+2];
-    const bright=(R+G+B)/3;
-    const sat=(Math.max(R,G,B)-Math.min(R,G,B));
-    if(bright>BRIGHT_MIN && sat<SAT_MAX){
-      const px=(i/4)%sw, py=Math.floor((i/4)/sw);
-      pts.push({px,py});count++;sumx+=px;sumy+=py;
-      if(px<minx)minx=px;if(px>maxx)maxx=px;
-      if(py<miny)miny=py;if(py>maxy)maxy=py;
-    }
-  }
+  const pixel = ctx.getImageData(x,y,1,1).data;
+  const R = pixel[0], G = pixel[1], B = pixel[2];
+  const brightness = Math.round((R+G+B)/3);
+  const sat = Math.round((Math.max(R,G,B) - Math.min(R,G,B))); // saturation proxy
 
-  if(count<5)return{f:false};
-  const w=maxx-minx, h=maxy-miny;
-  if(w<2||h<2)return{f:false};
-  const r=Math.abs(w-h)/Math.max(w,h);
-  if(r>RND_MAX)return{f:false};
-
-  const cx=sx+(sumx/count), cy=sy+(sumy/count);
-  const vx=view.width/proc.width, vy=view.height/proc.height;
-  return{f:true, x:(view.width-cx*vx), y:(view.height-cy*vy)};
-}
-
-function loop(){
-  requestAnimationFrame(loop);
-  const now=performance.now();
-
-  if(stopT && now-stopT<5000){ if(lastFrame)vctx.putImageData(lastFrame,0,0); drawTrail(); return; }
-
-  vctx.save();
-  vctx.scale(-1,-1);
-  vctx.drawImage(vid,-view.width,-view.height,view.width,view.height);
-  vctx.restore();
-  drawTrail();
-
-  if(roi){
-    vctx.strokeStyle="#0f0";vctx.lineWidth=2;
-    vctx.strokeRect(roi.x,roi.y,ROI_SIZE,ROI_SIZE);
-  }
-
-  const r=detect();
-  if(r.f){
-    trail.push(r);
-    roi.x=r.x-ROI_SIZE/2;roi.y=r.y-ROI_SIZE/2;
-    vctx.fillStyle="#0f0";vctx.beginPath();vctx.arc(r.x,r.y,4,0,2*Math.PI);vctx.fill();
-    lastFrame=vctx.getImageData(0,0,view.width,view.height);
-    lastBall=r;hold=0;tracking=true;
-  } else if(tracking && lastBall){
-    hold++;
-    if(hold<=HOLD){trail.push(lastBall);roi.x=lastBall.x-ROI_SIZE/2;roi.y=lastBall.y-ROI_SIZE/2;}
-    else tracking=false;
-  }
-
-  if(trail.length>6){
-    const a=trail.at(-1),b=trail.at(-5);
-    const d=Math.hypot(a.x-b.x,a.y-b.y);
-    still=(d<1)?still+1:0;
-    if(still>STOP_FRAMES){
-      stopT=now;lastFrame=vctx.getImageData(0,0,view.width,view.height);
-      status.textContent="Stopped — showing trace";return;
-    }
-  }
-}
+  info.innerHTML = `
+    X:${Math.round(x)} Y:${Math.round(y)}<br>
+    R:${R}  G:${G}  B:${B}<br>
+    Brightness:${brightness}<br>
+    Saturation:${sat}
+  `;
+});
 </script>
+
 </body>
 </html>
