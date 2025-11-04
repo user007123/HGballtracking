@@ -1,199 +1,166 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-<meta charset="UTF-8" />
-<title>HoverGreens – Ball-Only Tracer</title>
-<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta charset="UTF-8">
+<title>HoverGreens Vision — Ball Only Tracker</title>
 <style>
-  :root { color-scheme: dark; }
-  body { margin:0; background:#000; color:#fff; font-family:Arial, sans-serif; text-align:center; }
-  h2 { margin:10px 0 6px; font-size:20px; }
-  #status { font-size:14px; color:#7dff7d; min-height:20px; margin:6px 0 8px; }
-  .row { display:flex; justify-content:center; gap:10px; flex-wrap:wrap; margin:6px 0; }
-  button { background:#111; color:#fff; border:1px solid #444; border-radius:8px; padding:8px 14px; cursor:pointer; }
-  button:hover { border-color:#4cff70; }
-  label { font-size:12px; color:#bbb; }
-  input[type="range"] { width:120px; vertical-align:middle; }
-  video { display:none; }
-  canvas { display:block; margin:8px auto; background:#000; }
-  #view { width:1180px; height:370px; }
-  #mask { position:absolute; right:14px; top:14px; width:220px; height:124px; border:1px solid #333; display:none; }
-  .stage { position:relative; width:1180px; margin:0 auto; }
-  .hint { color:#bbb; font-size:12px; margin-top:-2px; }
+    body { margin:0; background:black; color:white; text-align:center; font-family:Arial; }
+    canvas { display:block; margin:10px auto; background:black; }
+    #status { margin-bottom:8px; font-size:14px; color:#7dff7d; }
+    #mask { position:absolute; right:10px; top:10px; width:200px; height:100px; border:1px solid #333; display:none; }
 </style>
 </head>
 <body>
 
-<h2>HoverGreens — Ball-Only Tracer</h2>
+<h2>HoverGreens Vision — Ball-Only Tracking</h2>
+<div id="status">Starting camera…</div>
 
-<div class="row">
-  <button id="resetBtn">Reset</button>
-  <button id="debugBtn">Debug</button>
-  <label>Diff<span id="dVal">18</span>
-    <input id="diff" type="range" min="5" max="60" step="1" value="18" />
-  </label>
-  <label>MinArea<span id="minVal">80</span>
-    <input id="minA" type="range" min="20" max="400" step="5" value="80" />
-  </label>
-  <label>MaxArea<span id="maxVal">1200</span>
-    <input id="maxA" type="range" min="300" max="4000" step="50" value="1200" />
-  </label>
-</div>
-<div class="hint">Ball must start in green box. Roll ball — green trace appears, cyan circle marks stop.</div>
-<div id="status">⏳ Starting camera…</div>
-
-<video id="cam" autoplay playsinline muted></video>
-
-<div class="stage">
-  <canvas id="view" width="1180" height="370"></canvas>
-  <canvas id="mask" width="220" height="124"></canvas>
-</div>
+<video id="cam" autoplay playsinline muted style="display:none"></video>
+<canvas id="view" width="1180" height="370"></canvas>
+<canvas id="mask" width="200" height="100"></canvas>
 
 <script>
-const statusBox=document.getElementById('status');
-const video=document.getElementById('cam');
-const view=document.getElementById('view');
-const vctx=view.getContext('2d',{willReadFrequently:true});
-const mask=document.getElementById('mask');
-const mctx=mask.getContext('2d',{willReadFrequently:true});
-const proc=document.createElement('canvas');
-const pctx=proc.getContext('2d',{willReadFrequently:true});
+const statusEl = document.getElementById("status");
+const video = document.getElementById("cam");
+const canvas = document.getElementById("view");
+const ctx = canvas.getContext("2d", { willReadFrequently:true });
+const mask = document.getElementById("mask");
+const mctx = mask.getContext("2d", { willReadFrequently:true });
 
-const diff=document.getElementById('diff');
-const minA=document.getElementById('minA');
-const maxA=document.getElementById('maxA');
+const W = canvas.width, H = canvas.height;
+const SW = 480, SH = Math.round(480*(H/W)); // processing resolution
 
-// label live-updates
-const labels={diff:document.getElementById('dVal'),minA:document.getElementById('minVal'),maxA:document.getElementById('maxVal')};
-[diff,minA,maxA].forEach(inp=>{inp.oninput=()=>{labels[inp.id].textContent=' '+inp.value}; labels[inp.id].textContent=' '+inp.value;});
+const proc = document.createElement("canvas");
+proc.width = SW; proc.height = SH;
+const pctx = proc.getContext("2d",{willReadFrequently:true});
 
-document.getElementById('debugBtn').onclick=()=>mask.style.display=mask.style.display==='none'?'block':'none';
-document.getElementById('resetBtn').onclick=resetTracer;
+let lastGray = null;
+let path = [];
+let tracking = false;
+let lastPt = null;
+let speedEMA = 0, stillFrames = 0;
 
-// processing scale + tracking vars
-let sx=1, sy=1, lastGray=null, lastPt=null, path=[], tracing=false, speedEMA=0, stillCount=0;
+const GREEN_THRESHOLD = 1.25; // turf bias
+const WHITE_MIN = 180; // ball brightness threshold
+const MAX_SHADOW = 60; // reject dark pixels
+const MIN_AREA = 40;  // ball min pixels
+const MAX_AREA = 600; // ball max pixels
 
-// ✅ Start box (ball MUST begin here)
-const startBox={
-  x:view.width*0.20,
-  y:view.height*0.70,
-  w:view.width*0.12,
-  h:view.height*0.20
+// ✅ Start box (must begin here)
+const startBox = {
+  x: W*0.18, y: H*0.65,
+  w: W*0.15, h: H*0.28
 };
 
-navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'},audio:false})
+navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
 .then(stream=>{
-  video.srcObject=stream;
-  video.onloadedmetadata=()=>{
-    video.play();
-    proc.width=480; proc.height=Math.round(480*(view.height/view.width));
-    sx=view.width/proc.width; sy=view.height/proc.height;
-    statusBox.textContent='📷 Camera ready — place ball in green box & roll';
-    requestAnimationFrame(loop);
-  };
-}).catch(e=>statusBox.textContent='❌ Camera error '+e);
+    video.srcObject = stream;
+    video.onloadedmetadata = ()=>{
+        video.play();
+        statusEl.textContent="📷 Camera ready — place ball in start box";
+        requestAnimationFrame(loop);
+    };
+});
 
-function toGray(buf){
-  const g=new Uint8Array(buf.length/4);
-  for(let i=0,j=0;i<buf.length;i+=4,j++){
-    g[j]=(0.2126*buf[i]+0.7152*buf[i+1]+0.0722*buf[i+2])|0;
-  }
-  return g;
-}
-
-function motionCenter(curr,prev,w,h,thr,min,max){
-  if(!prev) return null;
-  let sx=0,sy=0,c=0;
-  for(let y=0,i=0;y<h;y++){
-    for(let x=0;x<w;x++,i++){
-      const d=Math.abs(curr[i]-prev[i]);
-      if(d>=thr){sx+=x;sy+=y;c++;}
+function toGray(data){
+    const g = new Uint8Array(data.length/4);
+    for(let i=0,j=0;i<data.length;i+=4,j++){
+        const r=data[i],g0=data[i+1],b=data[i+2];
+        g[j]=(0.2126*r+0.7152*g0+0.0722*b)|0;
     }
-  }
-  if(c<min||c>max) return null;
-  return {x:sx/c,y:sy/c,area:c};
+    return g;
 }
 
-function resetTracer(){path=[];tracing=false;speedEMA=0;stillCount=0;lastPt=null;statusBox.textContent='↺ Reset — roll ball';}
+function detectBall(curr, prev){
+    if(!prev) return null;
+    let sx=0, sy=0, count=0;
+
+    for(let y=0,i=0;y<SH;y++){
+        for(let x=0;x<SW;x++,i++){
+            const d = Math.abs(curr[i] - prev[i]);
+
+            // reject low movement
+            if(d < 15) continue;
+
+            // inspect raw pixel
+            const px = pctx.getImageData(x,y,1,1).data;
+            const r=px[0], g=px[1], b=px[2];
+
+            // ✅ Must be bright white-ish object
+            const brightness = (r+g+b)/3;
+            const greenBias = g / ((r+b)/2+1);
+
+            if(brightness < WHITE_MIN) continue;       // must be bright
+            if(brightness - Math.min(r,g,b) > 80) continue; // eliminate highlights/glare
+            if(greenBias > GREEN_THRESHOLD) continue; // reject turf + shadows
+
+            // ✅ potential ball
+            sx += x; sy += y; count++;
+        }
+    }
+
+    if(count < MIN_AREA || count > MAX_AREA) return null;
+
+    return { x:sx/count, y:sy/count, area:count };
+}
 
 function loop(){
-  vctx.drawImage(video,0,0,view.width,view.height);
-  pctx.drawImage(video,0,0,proc.width,proc.height);
-  const img=pctx.getImageData(0,0,proc.width,proc.height);
-  const curr=toGray(img.data);
+    ctx.drawImage(video,0,0,W,H);
+    pctx.drawImage(video,0,0,SW,SH);
 
-  const ctr=motionCenter(curr,lastGray,proc.width,proc.height,+diff.value,+minA.value,+maxA.value);
+    const frame = pctx.getImageData(0,0,SW,SH);
+    const gray = toGray(frame.data);
 
-  // ✅ Draw start-box
-  vctx.strokeStyle="#00ff88"; vctx.lineWidth=2;
-  vctx.strokeRect(startBox.x,startBox.y,startBox.w,startBox.h);
+    // draw start box
+    ctx.strokeStyle = "#00ff88"; ctx.lineWidth=3;
+    ctx.strokeRect(startBox.x, startBox.y, startBox.w, startBox.h);
 
-  if(mask.style.display!=='none'){
-    const mImg=mctx.createImageData(mask.width,mask.height);
-    for(let my=0;my<mask.height;my++){
-      const py=Math.floor(my*proc.height/mask.height);
-      for(let mx=0;mx<mask.width;mx++){
-        const px=Math.floor(mx*proc.width/mask.width);
-        const i=py*proc.width+px;
-        const d=lastGray?Math.abs(curr[i]-lastGray[i]):0;
-        const v=d>=+diff.value?255:0;
-        const o=(my*mask.width+mx)*4;
-        mImg.data[o]=v;mImg.data[o+1]=v;mImg.data[o+2]=v;mImg.data[o+3]=255;
-      }
-    }
-    mctx.putImageData(mImg,0,0);
-  }
+    let ball = null;
+    if(lastGray) ball = detectBall(gray,lastGray);
 
-  if(ctr){
-    const dx=ctr.x*sx, dy=ctr.y*sy;
-    const inBox = dx>startBox.x && dx<startBox.x+startBox.w &&
-                  dy>startBox.y && dy<startBox.y+startBox.h;
+    if(ball){
+        const x = ball.x * (W/SW), y = ball.y * (H/SH);
+        const inStart = x>startBox.x && x<startBox.x+startBox.w && y>startBox.y && y<startBox.y+startBox.h;
 
-    const roundScore = Math.min(ctr.area/200,1);
-    if(!tracing && roundScore<0.2){ lastGray=curr; requestAnimationFrame(loop); return; }
+        if(!tracking){
+            if(inStart){
+                tracking=true;
+                statusEl.textContent="🏁 Ball detected — roll!";
+            }
+        } else {
+            // track ball movement
+            if(lastPt){
+                const dist = Math.hypot(x-lastPt.x,y-lastPt.y);
+                const speed = dist * 30;
+                speedEMA = 0.2*speed + 0.8*speedEMA;
 
-    // ✅ Must start ball in box
-    if(!tracing && !inBox){ lastPt={x:dx,y:dy}; lastGray=curr; requestAnimationFrame(loop); return; }
+                if(dist>1.2) path.push({x,y});
+                if(speedEMA < 5) stillFrames++; else stillFrames=0;
 
-    if(lastPt){
-      const dist=Math.hypot(dx-lastPt.x,dy-lastPt.y);
-      const speed=dist/(1/30);
-      speedEMA=speed*0.25+speedEMA*0.75;
-
-      if(!tracing && dist>1.8){
-        tracing=true; path=[{x:dx,y:dy}]; stillCount=0;
-        statusBox.textContent='🚀 Tracking…';
-      }
-
-      if(tracing){
-        if(dist>0.4) path.push({x:dx,y:dy});
-        if(speedEMA<12){
-          stillCount++;
-          if(stillCount>8){
-            tracing=false;
-            const end=path[path.length-1]||{x:dx,y:dy};
-            vctx.strokeStyle="#00ffff"; vctx.lineWidth=4;
-            vctx.beginPath(); vctx.arc(end.x,end.y,12,0,Math.PI*2); vctx.stroke();
-            statusBox.textContent='⛳ Ball stopped';
-          }
-        } else stillCount=0;
-      }
+                if(stillFrames>6){
+                    tracking=false;
+                    // Draw stop circle
+                    ctx.strokeStyle="#00ffff"; ctx.lineWidth=4;
+                    ctx.beginPath(); ctx.arc(x,y,10,0,Math.PI*2); ctx.stroke();
+                    statusEl.textContent="⛳ Ball stopped";
+                }
+            }
+            lastPt={x,y};
+            // marker
+            ctx.fillStyle="#00ff6a"; ctx.beginPath();
+            ctx.arc(x,y,6,0,Math.PI*2); ctx.fill();
+        }
     }
 
-    vctx.fillStyle="#00ff6a"; vctx.beginPath();
-    vctx.arc(dx,dy,5,0,Math.PI*2); vctx.fill();
-    lastPt={x:dx,y:dy};
-  }
+    if(path.length>1){
+        ctx.strokeStyle="#00ff80"; ctx.lineWidth=4;
+        ctx.beginPath(); ctx.moveTo(path[0].x,path[0].y);
+        for(let i=1;i<path.length;i++) ctx.lineTo(path[i].x,path[i].y);
+        ctx.stroke();
+    }
 
-  if(path.length>1){
-    vctx.strokeStyle="#00ff80"; vctx.lineWidth=4;
-    vctx.beginPath(); vctx.moveTo(path[0].x,path[0].y);
-    for(let i=1;i<path.length;i++) vctx.lineTo(path[i].x,path[i].y);
-    vctx.stroke();
-  }
-
-  lastGray=curr;
-  requestAnimationFrame(loop);
+    lastGray = gray;
+    requestAnimationFrame(loop);
 }
 </script>
 </body>
