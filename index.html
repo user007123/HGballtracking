@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>HoverGreens Vision — Sticky v2.5 (Fast Multi-Direction ROI + Camera Flip)</title>
+<title>HoverGreens Vision — Sticky v3.0 (Ultra-Fast Any-Direction)</title>
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <style>
   :root { color-scheme: dark }
@@ -24,8 +24,13 @@
   <div id="status">Initializing camera…</div>
 </header>
 
+<!-- Camera feed -->
 <video id="cam" autoplay playsinline muted></video>
-<canvas id="proc" width="960" height="540"></canvas>
+
+<!-- Low-res processing canvas for speed (downsampled) -->
+<canvas id="proc" width="640" height="360"></canvas>
+
+<!-- Display canvas (projection aspect) -->
 <canvas id="view" width="1180" height="370"></canvas>
 
 <script>
@@ -36,33 +41,36 @@ const view=document.getElementById("view"), vctx=view.getContext("2d",{willReadF
 const statusEl=document.getElementById("status");
 const resetBtn=document.getElementById("resetBtn");
 
-/* ===== TUNING ===== */
-const ROI_SIZE=44;
-const BRIGHT_MIN=200;
-const SAT_MAX=0.14;
-const AREA_MIN=4, AREA_MAX=380;
-const ROUND_MAX=0.62;
-const CONF_THRESH=0.52;
+/* ===== TUNING (720p @ 60fps, overhead, white ball on green) ===== */
+const ROI_SIZE       = 44;   // constant tiny ROI (view space px)
+const BRIGHT_MIN     = 200;  // white
+const SAT_MAX        = 0.16; // low saturation ≈ white
+const AREA_MIN       = 4;    // minimum candidate pixels
+const AREA_MAX       = 380;  // reject big blobs
+const ROUND_MAX      = 0.62; // roundness gate (|w-h|/max)
+const CONF_THRESH    = 0.50; // accept threshold (keep snappy)
 
-const STOP_EPS=1.0, STOP_FRAMES=6, GHOST_HOLD=5000;
+const STOP_EPS       = 0.9;  // px motion window to consider still
+const STOP_FRAMES    = 6;    // frames under STOP_EPS => stopped
+const GHOST_HOLD     = 5000; // ms hold trace after stop
 
-const HOLD_FRAMES=3; // brief shadow tolerance
-const NUDGE_MAX=1;   // tiny nudge only, almost invisible
+const HOLD_FRAMES    = 1;    // 1-frame shadow tolerance (no hesitation)
+const NUDGE_MAX      = 0;    // no nudge; pure stick to centroid
 
 /* ===== STATE ===== */
-let roi=null;
+let roi=null;                 // {x,y} top-left
 let tracking=false;
-let trail=[];
+let trail=[];                 // [{x,y}]
 let lastBall=null;
 let lastVel={x:0,y:0};
-let hold=0, still=0, stopTime=null, lastFrame=null;
+let hold=0, still=0;
+let stopTime=null, lastFrame=null;
 
 /* ===== HELPERS ===== */
-const clamp=(v,min,max)=>Math.max(min,Math.min(max,v));
-function toProc(x,y){
+function toProc(x,y){ // view -> proc (view is mirrored BOTH ways)
   return {
-    px:(view.width - x)*(proc.width/view.width),
-    py:(view.height - y)*(proc.height/view.height) // vertical flip
+    px:(view.width  - x)*(proc.width /view.width),
+    py:(view.height - y)*(proc.height/view.height)
   };
 }
 function drawTrail(){
@@ -71,77 +79,118 @@ function drawTrail(){
   vctx.lineWidth=4;
   vctx.beginPath();
   vctx.moveTo(trail[0].x,trail[0].y);
-  for(let i=1;i<trail.length;i++){vctx.lineTo(trail[i].x,trail[i].y);}
+  for(let i=1;i<trail.length;i++) vctx.lineTo(trail[i].x,trail[i].y);
   vctx.stroke();
 }
 
-/* ===== CAMERA ===== */
+/* ===== CAMERA (request 1280x720 @ 60fps) ===== */
 navigator.mediaDevices.getUserMedia({
-  video:{width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30},facingMode:"environment"},
+  video:{
+    width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:60, max:60},
+    facingMode:"environment"
+  },
   audio:false
 }).then(s=>{
   vid.srcObject=s;
-  vid.onloadedmetadata=()=>{ vid.play(); statusEl.textContent="✅ Click on ball to lock"; loop(); };
-}).catch(()=>statusEl.textContent="❌ Camera blocked");
+  vid.onloadedmetadata=()=>{ vid.play(); statusEl.textContent="✅ Click directly on the ball to lock"; loop(); };
+}).catch(err=>{
+  statusEl.textContent="❌ Camera blocked — allow permissions & use HTTPS";
+  console.error(err);
+});
 
 /* ===== RESET ===== */
 function resetAll(){
   roi=null; tracking=false; trail=[]; lastBall=null; lastVel={x:0,y:0};
   hold=0; still=0; stopTime=null; lastFrame=null;
-  statusEl.textContent="↺ Reset — click ball";
+  statusEl.textContent="↺ Reset — click ball to lock";
 }
 resetBtn.onclick=resetAll;
 
 /* ===== CLICK TO LOCK ROI ===== */
-view.addEventListener("click", e=>{
+view.addEventListener("click", (e)=>{
   const r=view.getBoundingClientRect();
   const x=(e.clientX-r.left)*(view.width/r.width);
   const y=(e.clientY-r.top)*(view.height/r.height);
   resetAll();
-  roi={x:x-ROI_SIZE/2, y:y-ROI_SIZE/2};
+  roi={ x:x-ROI_SIZE/2, y:y-ROI_SIZE/2 };
   statusEl.textContent="🎯 Locked — roll";
 });
 
-/* ===== DETECTION ===== */
+/* ===== ULTRA-FAST DETECTION in constant ROI
+   1) Try strict bright/round cluster (preferred)
+   2) If not enough/confident: FALLBACK to brightest-20 weighted centroid (snap!)
+===== */
 function detectBall(){
   if(!roi) return {found:false};
+
+  // Map ROI to proc coords
   const pr=toProc(roi.x,roi.y);
   const sx=Math.floor(pr.px), sy=Math.floor(pr.py);
-  const sw=Math.floor(ROI_SIZE*(proc.width/view.width));
+  const sw=Math.floor(ROI_SIZE*(proc.width /view.width));
   const sh=Math.floor(ROI_SIZE*(proc.height/view.height));
+
+  // Draw full frame -> proc, then sample ROI
   pctx.drawImage(vid,0,0,proc.width,proc.height);
   if(sw<1||sh<1||sx<0||sy<0||sx+sw>proc.width||sy+sh>proc.height) return {found:false};
-
   const img=pctx.getImageData(sx,sy,sw,sh).data;
-  let count=0,sumX=0,sumY=0,sumBright=0,minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
+
+  // Pass 1 — strict cluster
+  let count=0,sumX=0,sumY=0,sumB=0,minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
+  const brights=[];
   for(let i=0;i<img.length;i+=4){
     const R=img[i],G=img[i+1],B=img[i+2];
     const bright=(R+G+B)/3;
     const sat=(Math.max(R,G,B)-Math.min(R,G,B))/(Math.max(R,G,B)+1);
+    const px=(i/4)%sw, py=Math.floor((i/4)/sw);
     if(bright>BRIGHT_MIN && sat<SAT_MAX){
-      const px=(i/4)%sw, py=Math.floor((i/4)/sw);
-      count++; sumX+=px; sumY+=py; sumBright+=bright;
+      count++; sumX+=px; sumY+=py; sumB+=bright;
       if(px<minX)minX=px; if(px>maxX)maxX=px;
       if(py<minY)minY=py; if(py>maxY)maxY=py;
+      // store for fallback
+      brights.push({px,py,bright});
     }
   }
-  if(count<AREA_MIN||count>AREA_MAX) return {found:false};
-  const w=maxX-minX, h=maxY-minY;
-  if(w>32||h>32) return {found:false};
-  const roundness=Math.abs(w-h)/Math.max(w,h||1);
-  if(roundness>ROUND_MAX) return {found:false};
 
-  const cxp=sx+(sumX/count), cyp=sy+(sumY/count);
-  const vx=view.width/proc.width, vy=view.height/proc.height;
-  const cx=view.width-(cxp*vx);
-  const cy=view.height-(cyp*vy); // vertical flip convert back
+  function toView(cx_p,cy_p){
+    const vx=view.width /proc.width, vy=view.height/proc.height;
+    return { x:view.width - (cx_p*vx), y:view.height - (cy_p*vy) };
+  }
 
-  const meanBright=sumBright/count;
-  const brightScore=Math.min(1,(meanBright-200)/40);
-  const roundScore=Math.max(0,1-(roundness/ROUND_MAX));
-  const conf=0.6*brightScore+0.4*roundScore;
+  // Evaluate strict
+  if(count>=AREA_MIN && count<=AREA_MAX){
+    const w=maxX-minX, h=maxY-minY;
+    if(w<=32 && h<=32){
+      const roundness=Math.abs(w-h)/Math.max(w,h||1);
+      if(roundness<=ROUND_MAX){
+        const cxp=sx+(sumX/count), cyp=sy+(sumY/count);
+        const {x:cx,y:cy}=toView(cxp,cyp);
+        const meanB=sumB/count;
+        const brightScore=Math.min(1,(meanB-200)/40);
+        const roundScore =Math.max(0,1-(roundness/ROUND_MAX));
+        const conf=0.6*brightScore+0.4*roundScore;
+        if(conf>=CONF_THRESH) return {found:true,x:cx,y:cy,conf};
+      }
+    }
+  }
 
-  return {found:true,x:cx,y:cy,conf};
+  // Pass 2 — SNAP fallback: top 20 brightest weighted centroid
+  if(brights.length>0){
+    brights.sort((a,b)=>b.bright-a.bright);
+    const top=brights.slice(0, Math.min(20, brights.length));
+    let wsum=0, cxw=0, cyw=0;
+    for(const p of top){
+      const w=Math.max(1, p.bright-200); // weight by brightness above 200
+      wsum+=w; cxw+=p.px*w; cyw+=p.py*w;
+    }
+    if(wsum>0){
+      const cxp=sx+(cxw/wsum), cyp=sy+(cyw/wsum);
+      const {x:cx,y:cy}=toView(cxp,cyp);
+      // Treat fallback as lower-confidence but acceptable for snap
+      return {found:true,x:cx,y:cy,conf:0.5};
+    }
+  }
+
+  return {found:false};
 }
 
 /* ===== MAIN LOOP ===== */
@@ -149,60 +198,71 @@ function loop(){
   requestAnimationFrame(loop);
   const now=performance.now();
 
-  if(stopTime && now-stopTime<GHOST_HOLD){
+  // 5s freeze replay
+  if(stopTime && now - stopTime < GHOST_HOLD){
     if(lastFrame) vctx.putImageData(lastFrame,0,0);
     drawTrail();
     return;
   }
 
+  // Draw live video flipped horizontally & vertically for overhead
   vctx.save();
-  vctx.scale(-1,-1); // flip horizontally & vertically
-  vctx.drawImage(vid,-view.width,-view.height,view.width,view.height);
+  vctx.scale(-1,-1);
+  vctx.drawImage(vid, -view.width, -view.height, view.width, view.height);
   vctx.restore();
 
+  // Draw existing trail
   drawTrail();
 
-  if(roi){
-    vctx.strokeStyle="#00ff88"; vctx.lineWidth=2;
-    vctx.strokeRect(roi.x,roi.y,ROI_SIZE,ROI_SIZE);
-  }
+  // Draw ROI
+  if(roi){ vctx.strokeStyle="#00ff88"; vctx.lineWidth=2; vctx.strokeRect(roi.x,roi.y,ROI_SIZE,ROI_SIZE); }
 
+  // Detect ball (strict -> snap fallback)
   const hit=detectBall();
 
-  if(hit.found && hit.conf>=CONF_THRESH){
+  if(hit.found && hit.conf>=0.5){ // accept fallback too
     const pt={x:hit.x,y:hit.y};
-    trail.push(pt);
-    if(lastBall){
-      lastVel={x:pt.x-lastBall.x,y:pt.y-lastBall.y};
-    }
+    trail.push(pt);                           // add to trace immediately
+    // update velocity (for future use / diagnostics)
+    if(lastBall){ lastVel={x:pt.x-lastBall.x, y:pt.y-lastBall.y}; }
     lastBall=pt;
-    roi.x=pt.x-ROI_SIZE/2; roi.y=pt.y-ROI_SIZE/2;
-    hold=0;
+
+    // ALWAYS center ROI on ball this frame (zero inertia)
+    roi.x=pt.x-ROI_SIZE/2;
+    roi.y=pt.y-ROI_SIZE/2;
+
+    // Draw small dot on ball
     vctx.fillStyle="#00ff6a";
     vctx.beginPath(); vctx.arc(pt.x,pt.y,4,0,2*Math.PI); vctx.fill();
+
+    // Save frame for replay
     lastFrame=vctx.getImageData(0,0,view.width,view.height);
-    if(!tracking){tracking=true;statusEl.textContent="🚀 Tracking";}
+
+    if(!tracking){ tracking=true; statusEl.textContent="🚀 Tracking (60fps)"; }
+    hold=0;
+
   } else if(tracking && lastBall){
+    // 1-frame hold for shadow — no nudging (pure hold)
     hold++;
     if(hold<=HOLD_FRAMES){
-      const mag=Math.hypot(lastVel.x,lastVel.y);
-      if(mag>0.01){
-        roi.x+=lastVel.x/mag*Math.min(NUDGE_MAX,mag);
-        roi.y+=lastVel.y/mag*Math.min(NUDGE_MAX,mag);
-      }
-      trail.push(lastBall);
-    }else{
-      tracking=false;statusEl.textContent="⚠️ Lost — click to relock";
+      trail.push(lastBall); // keep line continuous
+      // keep ROI where it was (centered on lastBall)
+      roi.x=lastBall.x-ROI_SIZE/2;
+      roi.y=lastBall.y-ROI_SIZE/2;
+    } else {
+      tracking=false;
+      statusEl.textContent="⚠️ Lost — click to re-lock";
     }
   }
 
+  // Stop detection (line-based, robust to 60fps)
   if(trail.length>6){
-    const a=trail.at(-1),b=trail.at(-5);
-    const d=Math.hypot(a.x-b.x);
+    const a=trail.at(-1), b=trail.at(-5);
+    const d=Math.hypot(a.x-b.x, a.y-b.y);
     still=(d<STOP_EPS)?still+1:0;
     if(still>STOP_FRAMES){
       stopTime=now;
-      statusEl.textContent="⛳ Ball stopped";
+      statusEl.textContent="⛳ Ball stopped — holding trace";
       lastFrame=vctx.getImageData(0,0,view.width,view.height);
       return;
     }
